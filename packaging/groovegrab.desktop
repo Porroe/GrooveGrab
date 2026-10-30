@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=GrooveGrab
+Comment=Browse music and copy albums to a player
+Exec=groovegrab
+Icon=audio-x-generic
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=music;album;SD;USB;

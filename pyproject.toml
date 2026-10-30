@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "groovegrab"
+version = "0.2.0"
+description = "GrooveGrab is a read-only music library browser and removable-drive transfer app"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.7,<7", "mutagen>=1.47", "Pillow>=10"]
+
+[project.scripts]
+groovegrab = "music_transfer.app:main"
+
+[tool.setuptools.package-data]
+music_transfer = ["qml/*.qml"]
+
+[tool.setuptools.packages.find]
+include = ["music_transfer*"]
+
+[tool.setuptools.data-files]
+"share/applications" = ["packaging/groovegrab.desktop"]
