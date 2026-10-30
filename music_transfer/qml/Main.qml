@@ -319,8 +319,8 @@ ApplicationWindow {
     }
 
     Sheet {
-        id: albumDialog; objectName: "albumDialog"; anchors.centerIn: parent; width: Math.min(win.width - 80, 680); height: Math.min(win.height - 80, 640); modal: true
-        title: win.selectedAlbum ? win.selectedAlbum.title + " — " + win.selectedAlbum.artist : "Album"
+        id: albumDialog; objectName: "albumDialog"; anchors.centerIn: parent
+        width: Math.min(win.width - 64, 680); height: Math.min(win.height - 64, 820); modal: true
         ColumnLayout {
             anchors.fill: parent
             Rectangle {

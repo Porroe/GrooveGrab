@@ -161,6 +161,15 @@ class UITests(AppFixture):
             APP.processEvents()
             dialog = window.findChild(QObject, 'albumDialog')
             self.assertTrue(dialog.property('visible'))
+            self.assertEqual(dialog.property('title'), '')
+            window.setProperty('width', 1100)
+            window.setProperty('height', 700)
+            wait_for(lambda: dialog.property('width') == 680
+                     and dialog.property('height') == 636)
+            window.setProperty('width', 1500)
+            window.setProperty('height', 1000)
+            wait_for(lambda: dialog.property('width') == 680
+                     and dialog.property('height') == 820)
             self.assertEqual(window.findChild(QObject, 'albumHeaderTitle').property('text'), 'Album')
             self.assertEqual(window.findChild(QObject, 'albumHeaderArtist').property('text'), 'Test artist')
             header_text = [
