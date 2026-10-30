@@ -12,9 +12,9 @@ from test_app import APP, AppFixture, make_wave, snapshot, wait_for
 
 
 class UITests(AppFixture):
-    def click_item(self, window, item):
+    def click_item(self, window, item, button=Qt.LeftButton):
         point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2))
-        QTest.mouseClick(window, Qt.LeftButton, Qt.NoModifier, QPoint(round(point.x()), round(point.y())))
+        QTest.mouseClick(window, button, Qt.NoModifier, QPoint(round(point.x()), round(point.y())))
 
     def find_visual_item(self, root, name):
         if root.objectName() == name:
@@ -156,6 +156,14 @@ class UITests(AppFixture):
             self.assertTrue(checkbox.property('checked'))
             self.assertFalse(window.findChild(QObject, 'albumDialog').property('visible'))
 
+            clear_selection = window.findChild(QObject, 'clearAlbumSelection')
+            self.assertTrue(clear_selection.property('visible'))
+            self.click_item(window, clear_selection)
+            APP.processEvents()
+            self.assertEqual(window.property('selectedAlbums').toVariant(), [])
+            self.assertFalse(checkbox.property('checked'))
+            self.assertFalse(clear_selection.property('visible'))
+
             details = self.find_visual_item(grid.property('contentItem'), 'albumDetailsClickArea')
             self.click_item(window, details)
             APP.processEvents()
@@ -181,6 +189,28 @@ class UITests(AppFixture):
             wait_for(lambda: bool(self.backend.selectedAlbumCover))
             artwork = window.findChild(QObject, 'albumHeaderArtwork')
             self.assertEqual(QUrl(artwork.property('source')), QUrl(self.backend.selectedAlbumCover))
+        finally:
+            delete(engine)
+
+    def test_album_context_menu_copies_album_without_selection(self):
+        engine = QQmlApplicationEngine()
+        try:
+            self.backend._source = ''
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            grid = window.findChild(QObject, 'albumGrid')
+            wait_for(lambda: self.find_visual_item(grid.property('contentItem'), 'albumCard') is not None)
+            card = self.find_visual_item(grid.property('contentItem'), 'albumCard')
+            self.click_item(window, card, Qt.RightButton)
+
+            menu = window.findChild(QObject, 'albumContextMenu')
+            menu_item = window.findChild(QObject, 'copyAlbumMenuItem')
+            wait_for(lambda: menu.property('visible'))
+            self.assertEqual(menu_item.property('text'), 'Copy this album')
+            self.assertTrue(menu_item.property('enabled'))
+            self.assertEqual(window.property('contextAlbumId'), self.album['id'])
+            self.assertEqual(window.property('selectedAlbums').toVariant(), [])
         finally:
             delete(engine)
 

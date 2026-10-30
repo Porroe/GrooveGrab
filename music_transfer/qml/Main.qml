@@ -15,6 +15,7 @@ ApplicationWindow {
     property color accent: dark ? "#b0a2ff" : "#6550cc"
     property var selectedAlbum: null
     property var selectedTracks: []
+    property string contextAlbumId: ""
     property string artistFilter: "All artists"
     property string conflictKind: "same_path"
     property string formatCandidatePath: ""
@@ -143,6 +144,16 @@ ApplicationWindow {
         target: backend.artists
         function onCountChanged() { if (artistPicker.currentIndex < 0 && backend.artists.count > 0) artistPicker.currentIndex = 0 }
     }
+    Menu {
+        id: albumContextMenu
+        objectName: "albumContextMenu"
+        MenuItem {
+            objectName: "copyAlbumMenuItem"
+            text: "Copy this album"
+            enabled: !!backend.target
+            onTriggered: backend.send(win.contextAlbumId, [])
+        }
+    }
     Component.onCompleted: { if (backend.source) backend.rescan() }
 
     ColumnLayout {
@@ -192,6 +203,7 @@ ApplicationWindow {
                 }
                 RowLayout {
                     Action { visible: win.selectedAlbums.length > 0; text: "Send selected albums (" + win.selectedAlbums.length + ")"; enabled: !!backend.target; onClicked: { backend.sendAlbums(win.selectedAlbums); win.selectedAlbums = [] } }
+                    Action { objectName: "clearAlbumSelection"; visible: win.selectedAlbums.length > 0; text: "Clear selection"; onClicked: win.selectedAlbums = [] }
                     Label { text: backend.albums.count + " albums"; color: win.muted }
                 }
                 RowLayout {
@@ -212,7 +224,15 @@ ApplicationWindow {
                         width: grid.cellWidth; height: grid.cellHeight
                         Component.onCompleted: backend.requestCover(modelData.id)
                         onModelDataChanged: if (!modelData.cover) backend.requestCover(modelData.id)
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            onTapped: {
+                                win.contextAlbumId = modelData.id
+                                albumContextMenu.popup(win.contentItem, mapToItem(win.contentItem, point.position))
+                            }
+                        }
                         Rectangle {
+                            objectName: "albumCard"
                             anchors.fill: parent; anchors.rightMargin: 14; anchors.bottomMargin: 14; radius: 14; color: win.panel
                             Column {
                                 anchors.fill: parent; anchors.margins: 10; spacing: 7
