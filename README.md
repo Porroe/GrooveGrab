@@ -33,6 +33,8 @@ All library/database work, artwork processing, file copying, and queue preparati
 
 ## Development checks
 
+Contributor setup, architecture, and development guidance are in the [developer documentation](docs/development.md).
+
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
 QT_QPA_PLATFORM=offscreen .venv/bin/python -m music_transfer.app --smoke-test
