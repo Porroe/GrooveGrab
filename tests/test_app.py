@@ -58,6 +58,7 @@ class AppFixture(unittest.TestCase):
         self.target = self.root / 'target'; self.target.mkdir()
         self.backend = Backend(index_path=self.root / 'data/library.sqlite3')
         self.backend.settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
+        self.backend._refresh_on_startup = self.backend.settings.value('refresh_on_startup', True, type=bool)
         self.backend.setConflictPolicy('ask_every_time')
         self.backend.setFormatPolicy('ask_every_time')
         self.backend.setSameFormatPolicy('ask_every_time')
@@ -89,6 +90,7 @@ class AppTests(AppFixture):
     def test_accepting_source_folder_saves_and_rescans(self):
         selected = self.root / 'selected-source'
         selected.mkdir()
+        self.backend._refresh_on_startup = False
         with patch.object(self.backend, 'rescan') as rescan:
             self.backend.accept_folder((str(selected), True))
         self.assertEqual(self.backend.source, str(selected))
@@ -304,28 +306,38 @@ class AppTests(AppFixture):
         self.assertTrue((self.target / 'Artist/Album/01.wav').exists())
 
     def test_settings_save_commits_all_policies_and_artwork(self):
+        self.assertTrue(self.backend.refreshOnStartup)
         self.assertTrue(self.backend.saveSettings(
-            'always_skip', 'copy_and_delete', 'replace_existing',
-            False, 'cover.jpeg', 300, 240))
+            'dark', 'always_skip', 'copy_and_delete', 'replace_existing',
+            False, False, 'cover.jpeg', 300, 240))
+        self.assertEqual(self.backend.theme, 'dark')
+        self.assertEqual(self.backend.settings.value('theme'), 'dark')
         self.assertEqual(self.backend.conflictPolicy, 'always_skip')
         self.assertEqual(self.backend.formatPolicy, 'copy_and_delete')
         self.assertEqual(self.backend.sameFormatPolicy, 'replace_existing')
+        self.assertFalse(self.backend.refreshOnStartup)
         self.assertEqual(self.backend.artwork, {
             'enabled': False, 'filename': 'cover.jpeg', 'width': 300, 'height': 240,
         })
         self.assertEqual(self.backend.settings.value('same_format_policy'), 'replace_existing')
+        self.assertFalse(self.backend.settings.value('refresh_on_startup', type=bool))
 
     def test_settings_save_rejects_invalid_values_without_partial_changes(self):
-        before = (self.backend.conflictPolicy, self.backend.formatPolicy,
-                  self.backend.sameFormatPolicy, self.backend.artwork)
+        before = (self.backend.theme, self.backend.conflictPolicy, self.backend.formatPolicy,
+                  self.backend.sameFormatPolicy, self.backend.refreshOnStartup,
+                  self.backend.artwork)
         self.assertFalse(self.backend.saveSettings(
-            'invalid', 'copy_and_delete', 'replace_existing',
-            False, 'cover.jpeg', 300, 240))
+            'invalid', 'always_skip', 'copy_and_delete', 'replace_existing',
+            True, False, 'cover.jpeg', 300, 240))
         self.assertFalse(self.backend.saveSettings(
-            'always_skip', 'copy_and_delete', 'replace_existing',
-            False, '../cover.jpeg', 300, 240))
-        self.assertEqual((self.backend.conflictPolicy, self.backend.formatPolicy,
-                          self.backend.sameFormatPolicy, self.backend.artwork), before)
+            'system', 'invalid', 'copy_and_delete', 'replace_existing',
+            True, False, 'cover.jpeg', 300, 240))
+        self.assertFalse(self.backend.saveSettings(
+            'system', 'always_skip', 'copy_and_delete', 'replace_existing',
+            True, False, '../cover.jpeg', 300, 240))
+        self.assertEqual((self.backend.theme, self.backend.conflictPolicy, self.backend.formatPolicy,
+                          self.backend.sameFormatPolicy, self.backend.refreshOnStartup,
+                          self.backend.artwork), before)
 
     def test_format_policy_ask_every_time_can_replace_or_copy_alongside(self):
         first = self.album['tracks'][0]

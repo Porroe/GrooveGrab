@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import errno
 import hashlib
 import json
@@ -12,9 +13,10 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
-from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl, QSettings, QTimer
+from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl, QSettings, QTimer, QBuffer, QIODevice
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtWidgets import QStyle, QStyleFactory
 from .core import (ArtworkSettings, ThumbnailCache, overlaps, destination,
                    copy_audio, atomic_write, cover_image, jpeg_bytes, read_track, EXTENSIONS, Cancelled)
 from .database import LibraryIndex, database_path
@@ -69,12 +71,28 @@ def fingerprint(album):
     return hashlib.sha256(json.dumps([(t['path'], t.get('size'), t.get('mtime_ns')) for t in album['tracks']]).encode()).hexdigest()
 
 
+def clear_button_icons():
+    style_name = {'darwin': 'macOS', 'win32': 'Windows'}.get(sys.platform, 'Fusion')
+    style = QStyleFactory.create(style_name) or QStyleFactory.create('Fusion')
+    if style is None:
+        raise RuntimeError('Could not load a Qt style for the search clear icon.')
+    icon = style.standardIcon(QStyle.SP_LineEditClearButton)
+    if icon.isNull():
+        raise RuntimeError('Qt did not provide a standard search clear icon.')
+    buffer = QBuffer()
+    if not buffer.open(QIODevice.WriteOnly) or not icon.pixmap(32, 32).save(buffer, 'PNG'):
+        raise RuntimeError('Could not render the standard search clear icon.')
+    return 'data:image/png;base64,' + base64.b64encode(bytes(buffer.data())).decode('ascii')
+
+
 class Backend(QObject):
     changed = Signal()
     libraryChanged = Signal()
     selectedAlbumCoverChanged = Signal()
     libraryReset = Signal()
     libraryProgressChanged = Signal()
+    sourceAvailabilityChanged = Signal()
+    sourceAccessConfirmed = Signal()
     conflict = Signal(str)
     formatConflict = Signal(str, str, object)
     notify = Signal(str)
@@ -96,7 +114,9 @@ class Backend(QObject):
         self._format_policy = format_policy if format_policy in FORMAT_POLICIES else 'ask_every_time'
         same_format_policy = self.settings.value('same_format_policy', 'ask_every_time')
         self._same_format_policy = same_format_policy if same_format_policy in SAME_FORMAT_POLICIES else 'ask_every_time'
+        self._refresh_on_startup = self.settings.value('refresh_on_startup', True, type=bool)
         self._art = ArtworkSettings(**json.loads(self.settings.value('artwork', '{}')))
+        self._clear_button_icon = clear_button_icons()
         self.index_path = Path(index_path or database_path())
         self._albums, self._queue, self._results = [], [], []
         self.catalog = {}
@@ -163,16 +183,20 @@ class Backend(QObject):
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.schedule_query)
         self._last_root = ''
+        self._source_available = True
         self._shutdown_started = False
         self._shutdown_complete = False
+        self.sourceAccessConfirmed.connect(self.confirmSourceAvailable)
 
     shutdownComplete = Property(bool, lambda s: s._shutdown_complete, notify=shutdownFinished)
+    sourceAvailable = Property(bool, lambda s: s._source_available, notify=sourceAvailabilityChanged)
     source = Property(str, lambda s: s._source, notify=changed)
     target = Property(str, lambda s: s._target, notify=changed)
     theme = Property(str, lambda s: s._theme, notify=changed)
     conflictPolicy = Property(str, lambda s: s._conflict_policy, notify=changed)
     formatPolicy = Property(str, lambda s: s._format_policy, notify=changed)
     sameFormatPolicy = Property(str, lambda s: s._same_format_policy, notify=changed)
+    refreshOnStartup = Property(bool, lambda s: s._refresh_on_startup, notify=changed)
     albums = Property(QObject, lambda s: s.album_model, constant=True)
     tracks = Property(QObject, lambda s: s.track_model, constant=True)
     folders = Property(QObject, lambda s: s.folder_model, constant=True)
@@ -186,6 +210,7 @@ class Backend(QObject):
     progress = Property(float, lambda s: s._progress, notify=changed)
     status = Property(str, lambda s: s._status, notify=changed)
     artwork = Property('QVariantMap', lambda s: asdict(s._art), notify=changed)
+    clearButtonIcon = Property(str, lambda s: s._clear_button_icon, constant=True)
     selectedAlbumCover = Property(str, lambda s: s.selected_album_cover(), notify=selectedAlbumCoverChanged)
     libraryStatus = Property(str, lambda s: s._library_status, notify=libraryProgressChanged)
     libraryStage = Property(str, lambda s: s._library_stage, notify=libraryProgressChanged)
@@ -226,9 +251,13 @@ class Backend(QObject):
         self.settings.setValue('same_format_policy', policy)
         self.changed.emit()
 
-    @Slot(str, str, str, bool, str, int, int, result=bool)
-    def saveSettings(self, conflict_policy, format_policy, same_format_policy,
-                     artwork_enabled, artwork_filename, artwork_width, artwork_height):
+    @Slot(str, str, str, str, bool, bool, str, int, int, result=bool)
+    def saveSettings(self, theme, conflict_policy, format_policy, same_format_policy,
+                     refresh_on_startup, artwork_enabled, artwork_filename,
+                     artwork_width, artwork_height):
+        if theme not in ('system', 'light', 'dark'):
+            self.notify.emit('Choose a valid theme.')
+            return False
         if conflict_policy not in CONFLICT_POLICIES:
             self.notify.emit('Choose a valid existing-file setting.')
             return False
@@ -245,16 +274,19 @@ class Backend(QObject):
             self.notify.emit(str(error))
             return False
 
+        self._theme = theme
         self._conflict_policy = conflict_policy
         self._format_policy = format_policy
         self._same_format_policy = same_format_policy
+        self._refresh_on_startup = refresh_on_startup
         self._art = artwork
+        self.settings.setValue('theme', theme)
         self.settings.setValue('conflict_policy', conflict_policy)
         self.settings.setValue('format_policy', format_policy)
         self.settings.setValue('same_format_policy', same_format_policy)
+        self.settings.setValue('refresh_on_startup', refresh_on_startup)
         self.settings.setValue('artwork', json.dumps(asdict(artwork)))
         self.changed.emit()
-        self.notify.emit('Settings saved.')
         return True
 
     @Slot(str, bool)
@@ -296,6 +328,59 @@ class Backend(QObject):
         with self.mailbox_lock:
             self.library_events.append(event)
 
+    def reset_library_for_root(self, root):
+        if self._last_root == root:
+            return
+        self.query_generation += 1
+        self._selected_album_id = ''
+        self.libraryReset.emit()
+        with self.catalog_lock:
+            self.catalog = {}
+        self.album_model.submit([])
+        self.folder_model.submit([])
+        self.track_model.submit([])
+        self.cover_pending.clear()
+        self._last_root = root
+
+    @Slot()
+    def loadSavedLibrary(self):
+        if self._scanning or not self._source or self.stopping:
+            return
+        self.scan_generation += 1
+        generation = self.scan_generation
+        root = self._source
+        self.reset_library_for_root(root)
+        self._scanning = True
+        self._library_stage = 'Loading saved library'
+        self._library_status = 'Loading saved library…'
+        self._library_progress = 0
+        self._library_done = self._library_total = 0
+        self.libraryProgressChanged.emit()
+
+        def work():
+            index = None
+            try:
+                resolved = Path(root).resolve()
+                protected = [self.index_path.resolve(), self.cache.directory.resolve(),
+                             Path(self.settings.fileName()).resolve()]
+                if any(path == resolved or resolved in path.parents for path in protected):
+                    raise ValueError('Music source must not contain app data, settings, or cache')
+                index = LibraryIndex(self.index_path)
+                if index.recovered:
+                    self.notify.emit('Saved an unusable database as ' + str(index.recovered) + '; rebuilding the index.')
+                cached = index.load(root)
+                saved_covers = index.artwork(root)
+                self.publish_catalog(group_tracks(cached.values()), root, generation, saved_covers)
+                self.post_library((generation, 'finished', 'Loaded saved library'))
+            except Exception as error:
+                self.post_library((generation, 'finished', str(error)))
+            finally:
+                if index:
+                    index.close()
+
+        self.scan_thread = threading.Thread(target=work, name='library-load', daemon=True)
+        self.scan_thread.start()
+
     @Slot()
     def rescan(self):
         if self._scanning or not self._source or self.stopping:
@@ -303,17 +388,7 @@ class Backend(QObject):
         self.scan_generation += 1
         generation = self.scan_generation
         root = self._source
-        if self._last_root != root:
-            self.query_generation += 1
-            self._selected_album_id = ''
-            self.libraryReset.emit()
-            with self.catalog_lock:
-                self.catalog = {}
-            self.album_model.submit([])
-            self.folder_model.submit([])
-            self.track_model.submit([])
-            self.cover_pending.clear()
-            self._last_root = root
+        self.reset_library_for_root(root)
         self._scanning = True
         self.scan_cancel = threading.Event()
         cancel = self.scan_cancel
@@ -397,6 +472,14 @@ class Backend(QObject):
     @Slot()
     def cancelScan(self):
         self.scan_cancel.set()
+
+    @Slot()
+    def confirmSourceAvailable(self):
+        if self._source_available:
+            return
+        self._source_available = True
+        self.sourceAvailabilityChanged.emit()
+        self.libraryProgressChanged.emit()
 
     def prepare_album(self, album, previous, saved_covers):
         stamp = fingerprint(album)
@@ -724,6 +807,13 @@ class Backend(QObject):
                 self._scanning = False
                 self._library_status = latest[2]
                 self._library_stage = ''
+                unavailable = latest[2].startswith((
+                    'Library is unavailable',
+                    'Library disconnected during refresh',
+                ))
+                if self._source_available != (not unavailable):
+                    self._source_available = not unavailable
+                    self.sourceAvailabilityChanged.emit()
             self.libraryProgressChanged.emit()
         if self.transfer_dirty.is_set() and not getattr(self, '_snapshot_pending', False) and getattr(self, '_transfer_payload', None) is None:
             self.transfer_dirty.clear()
@@ -1197,6 +1287,7 @@ class Backend(QObject):
                                 done = self._album_done.get(job['album_id'], 0)
                                 self._progress_message = (job['id'], job['album_id'], fraction, (done + fraction) / total)
                         copy_audio(Path(job['path']), output, lambda: job['cancelled'], progress, lambda: self.validate_output(output, job))
+                        self.sourceAccessConfirmed.emit()
                         removal_error = self.remove_old_versions(old_versions, output, job)
                         message = 'Copied'
                         if removal_error:

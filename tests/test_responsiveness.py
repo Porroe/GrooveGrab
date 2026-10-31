@@ -34,6 +34,27 @@ class Heartbeat:
 
 
 class ResponsivenessTests(AppFixture):
+    def test_startup_loads_saved_index_without_refresh_when_disabled(self):
+        index = LibraryIndex(self.backend.index_path)
+        index.refresh(self.source)
+        index.close()
+        self.backend._source = str(self.source)
+        self.backend._refresh_on_startup = False
+
+        engine = QQmlApplicationEngine()
+        try:
+            engine.rootContext().setContextProperty('backend', self.backend)
+            with patch.object(LibraryIndex, 'refresh', side_effect=AssertionError('Startup refreshed library')), \
+                    patch('music_transfer.database.read_track', side_effect=AssertionError('Startup reread metadata')):
+                engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+                self.assertTrue(engine.rootObjects())
+                wait_for(lambda: not self.backend.scanning
+                         and self.backend.album_model.count == 1
+                         and self.backend.libraryStatus == 'Loaded saved library')
+            self.assertEqual(self.backend.album_model.rows[0]['title'], 'Album')
+        finally:
+            delete(engine)
+
     def test_cached_rows_appear_before_refresh_and_unchanged_tags_are_not_read(self):
         index = LibraryIndex(self.backend.index_path)
         index.refresh(self.source); index.close()

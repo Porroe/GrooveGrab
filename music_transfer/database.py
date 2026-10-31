@@ -73,31 +73,47 @@ class LibraryIndex:
         self.connection.close()
 
     def load(self, root):
+        root = str(Path(root).resolve())
         return {row[0]: dict(json.loads(row[3]), size=row[1], mtime_ns=row[2]) for row in
-                self.connection.execute('SELECT path,size,mtime_ns,metadata FROM tracks WHERE root=?', (str(root),))}
+                self.connection.execute('SELECT path,size,mtime_ns,metadata FROM tracks WHERE root=?', (root,))}
 
     def artwork(self, root):
+        root = str(Path(root).resolve())
         return {album_id: (fingerprint, url) for album_id, fingerprint, url in self.connection.execute(
-            'SELECT album_id,fingerprint,url FROM artwork WHERE root=?', (str(root),))}
+            'SELECT album_id,fingerprint,url FROM artwork WHERE root=?', (root,))}
+
+    def device_matches(self, root):
+        saved = self.connection.execute(
+            'SELECT device FROM libraries WHERE root=?', (str(Path(root).resolve()),)
+        ).fetchone()
+        if not saved:
+            return True
+        try:
+            return saved[0] == Path(root).resolve().stat().st_dev
+        except OSError:
+            return None
 
     def save_artwork(self, root, album_id, fingerprint, url):
+        root = str(Path(root).resolve())
         with self.connection:
             self.connection.execute('INSERT OR REPLACE INTO artwork VALUES (?,?,?,?)',
-                                    (str(root), album_id, fingerprint, url))
+                                    (root, album_id, fingerprint, url))
 
     def refresh(self, root, *, cancelled=lambda: False, progress=lambda *args: None,
                 batch=lambda tracks, removed: None):
         root = Path(root).resolve()
-        cached = self.load(root)
+        previous = self.load(root)
+        try:
+            device = root.stat().st_dev
+        except OSError as error:
+            raise OSError('Library is unavailable; saved index retained') from error
+        saved = self.connection.execute('SELECT device FROM libraries WHERE root=?', (str(root),)).fetchone()
+        device_changed = bool(saved and saved[0] != device)
+        cached = previous
         def check():
             if cancelled():
                 raise Cancelled()
         check()
-        # An unavailable mount must never turn a saved library into an empty one.
-        device = root.stat().st_dev
-        saved = self.connection.execute('SELECT device FROM libraries WHERE root=?', (str(root),)).fetchone()
-        if saved and saved[0] != device:
-            raise OSError('Library device changed or is unavailable; saved index retained')
         with os.scandir(root):
             pass
         discovered, unreadable = [], []
@@ -108,7 +124,7 @@ class LibraryIndex:
                 last[0] = now
                 progress(stage, done, total)
         def failed(error):
-            unreadable.append(Path(error.filename or root))
+            unreadable.append(Path(error.filename or root).resolve())
         report('Discovering files', 0, force=True)
         for parent, dirs, files in os.walk(root, followlinks=False, onerror=failed):
             check()
@@ -119,6 +135,8 @@ class LibraryIndex:
                 if path.suffix.lower() in EXTENSIONS and not path.is_symlink():
                     discovered.append(path)
                     report('Discovering files', len(discovered))
+        if device_changed and previous and not discovered:
+            raise OSError('Source changed and no tracks were found; saved library retained')
         updated, changes, persisted = {}, [], []
         report('Updating metadata', 0, len(discovered), True)
         for count, path in enumerate(discovered, 1):
@@ -146,11 +164,13 @@ class LibraryIndex:
         for relative, track in cached.items():
             if any((root / relative).is_relative_to(folder) for folder in unreadable):
                 updated.setdefault(relative, track)
+        if device_changed and previous and not updated:
+            raise OSError('Source changed and no tracks could be read; saved library retained')
         check()
         # Recheck device after walking, before committing any deletions.
         if root.stat().st_dev != device:
             raise OSError('Library disconnected during refresh; saved index retained')
-        removed = [relative for relative in cached if relative not in updated]
+        removed = [relative for relative in previous if relative not in updated]
         with self.connection:
             self.connection.execute('INSERT OR REPLACE INTO libraries VALUES (?,?,?)', (str(root), device, time.time()))
             self.connection.executemany('INSERT OR REPLACE INTO tracks VALUES (?,?,?,?,?)',

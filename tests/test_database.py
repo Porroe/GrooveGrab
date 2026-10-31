@@ -96,6 +96,58 @@ class IndexTests(unittest.TestCase):
             self.index.refresh(self.source)
         self.assertEqual(len(self.index.load(self.source)), 1)
 
+    def test_changed_device_reindexes_readable_source(self):
+        self.index.refresh(self.source)
+        old_track = self.source / 'Artist/Album/01.wav'
+        old_track.unlink()
+        new_track = self.source / 'Artist/New Album/01.wav'
+        make_wave(new_track, album='New Album')
+        with self.index.connection:
+            self.index.connection.execute(
+                'UPDATE libraries SET device=? WHERE root=?',
+                (self.source.stat().st_dev + 1, str(self.source.resolve())),
+            )
+
+        self.assertFalse(self.index.device_matches(self.source))
+        refreshed, errors = self.index.refresh(self.source)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual(next(iter(refreshed.values()))['album'], 'New Album')
+        self.assertEqual(set(self.index.load(self.source)), {'Artist/New Album/01.wav'})
+        self.assertEqual(self.index.device_matches(self.source), True)
+
+    def test_changed_device_reuses_unchanged_metadata_and_artwork(self):
+        self.index.refresh(self.source)
+        self.index.save_artwork(self.source, 'album', 'fingerprint', 'file:///cover.jpg')
+        with self.index.connection:
+            self.index.connection.execute(
+                'UPDATE libraries SET device=? WHERE root=?',
+                (self.source.stat().st_dev + 1, str(self.source.resolve())),
+            )
+
+        with patch('music_transfer.database.read_track', side_effect=AssertionError('Unchanged tags reread')):
+            refreshed, errors = self.index.refresh(self.source)
+
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(self.index.artwork(self.source)['album'], ('fingerprint', 'file:///cover.jpg'))
+        self.assertEqual(self.index.device_matches(self.source), True)
+
+    def test_changed_device_with_empty_source_retains_saved_index(self):
+        self.index.refresh(self.source)
+        self.track.unlink()
+        with self.index.connection:
+            self.index.connection.execute(
+                'UPDATE libraries SET device=? WHERE root=?',
+                (self.source.stat().st_dev + 1, str(self.source.resolve())),
+            )
+
+        with self.assertRaisesRegex(OSError, 'no tracks were found'):
+            self.index.refresh(self.source)
+
+        self.assertEqual(len(self.index.load(self.source)), 1)
+
     def test_unreadable_folder_is_not_deleted(self):
         self.index.refresh(self.source)
         real_walk = os.walk

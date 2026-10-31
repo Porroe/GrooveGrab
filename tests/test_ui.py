@@ -73,10 +73,25 @@ class UITests(AppFixture):
                     self.assertIsNotNone(window.findChild(QObject, 'settingsFilesPane'))
                     files_category = window.findChild(QObject, 'settingsFilesCategory')
                     artwork_category = window.findChild(QObject, 'settingsArtworkCategory')
+                    library_category = window.findChild(QObject, 'settingsLibraryCategory')
+                    appearance_category = window.findChild(QObject, 'settingsAppearanceCategory')
                     files_pane = window.findChild(QObject, 'settingsFilesPane')
                     artwork_pane = window.findChild(QObject, 'settingsArtworkPane')
+                    library_pane = window.findChild(QObject, 'settingsLibraryPane')
+                    appearance_pane = window.findChild(QObject, 'settingsAppearancePane')
                     self.assertTrue(files_pane.property('visible'))
                     self.assertFalse(artwork_pane.property('visible'))
+                    self.assertFalse(library_pane.property('visible'))
+                    self.assertFalse(appearance_pane.property('visible'))
+                    self.assertIsNotNone(window.findChild(QObject, 'clearThumbnailCache'))
+                    self.click_item(window, library_category)
+                    APP.processEvents()
+                    self.assertFalse(files_pane.property('visible'))
+                    self.assertTrue(library_pane.property('visible'))
+                    refresh_on_startup = window.findChild(QObject, 'refreshLibraryOnStartup')
+                    self.assertTrue(refresh_on_startup.property('checked'))
+                    self.click_item(window, files_category)
+                    APP.processEvents()
                     policy_picker = window.findChild(QObject, 'conflictPolicyPicker')
                     self.assertEqual(policy_picker.property('currentIndex'), 4)
                     dialog.setProperty('draftConflictPolicy', 'always_skip')
@@ -96,6 +111,17 @@ class UITests(AppFixture):
                     APP.processEvents()
                     self.assertFalse(files_pane.property('visible'))
                     self.assertTrue(artwork_pane.property('visible'))
+                    self.click_item(window, library_category)
+                    APP.processEvents()
+                    self.assertTrue(library_pane.property('visible'))
+                    self.click_item(window, refresh_on_startup)
+                    APP.processEvents()
+                    self.assertFalse(refresh_on_startup.property('checked'))
+                    self.click_item(window, appearance_category)
+                    APP.processEvents()
+                    self.assertTrue(appearance_pane.property('visible'))
+                    theme_picker = window.findChild(QObject, 'themePicker')
+                    self.assertIsNotNone(theme_picker)
                     cancel = window.findChild(QObject, 'settingsCancel')
                     save = window.findChild(QObject, 'settingsSave')
                     self.assertTrue(cancel.property('visible'))
@@ -106,13 +132,18 @@ class UITests(AppFixture):
                     self.assertEqual(self.backend.conflictPolicy, 'ask_every_time')
                     self.assertEqual(self.backend.formatPolicy, 'ask_every_time')
                     self.assertEqual(self.backend.sameFormatPolicy, 'ask_every_time')
+                    self.assertTrue(self.backend.refreshOnStartup)
+                    self.assertEqual(self.backend.theme, 'system')
 
                     QMetaObject.invokeMethod(dialog, 'open')
                     APP.processEvents()
+                    dialog.setProperty('draftTheme', 'dark')
                     dialog.setProperty('draftConflictPolicy', 'always_skip')
                     dialog.setProperty('draftFormatPolicy', 'copy_and_delete')
                     dialog.setProperty('draftSameFormatPolicy', 'replace_existing')
-                    self.click_item(window, artwork_category)
+                    self.click_item(window, library_category)
+                    APP.processEvents()
+                    self.click_item(window, refresh_on_startup)
                     APP.processEvents()
                     self.click_item(window, save)
                     APP.processEvents()
@@ -120,6 +151,12 @@ class UITests(AppFixture):
                     self.assertEqual(self.backend.conflictPolicy, 'always_skip')
                     self.assertEqual(self.backend.formatPolicy, 'copy_and_delete')
                     self.assertEqual(self.backend.sameFormatPolicy, 'replace_existing')
+                    self.assertFalse(self.backend.refreshOnStartup)
+                    self.assertEqual(self.backend.theme, 'dark')
+                    toast = window.findChild(QObject, 'settingsSavedToast')
+                    self.assertIsNotNone(toast)
+                    self.assertTrue(toast.property('visible'))
+                    self.assertFalse(toast.property('modal'))
                     dismiss = window.findChild(QObject, 'settingsDismiss')
                     self.assertIsNotNone(dismiss)
                     QMetaObject.invokeMethod(dialog, 'open')
@@ -189,6 +226,155 @@ class UITests(AppFixture):
             wait_for(lambda: bool(self.backend.selectedAlbumCover))
             artwork = window.findChild(QObject, 'albumHeaderArtwork')
             self.assertEqual(QUrl(artwork.property('source')), QUrl(self.backend.selectedAlbumCover))
+        finally:
+            delete(engine)
+
+    def test_current_selection_lists_and_removes_albums_and_tracks(self):
+        engine = QQmlApplicationEngine()
+        try:
+            self.backend._source = ''
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            grid = window.findChild(QObject, 'albumGrid')
+            wait_for(lambda: self.find_visual_item(grid.property('contentItem'), 'albumArtworkClickArea') is not None)
+
+            artwork = self.find_visual_item(grid.property('contentItem'), 'albumArtworkClickArea')
+            self.click_item(window, artwork)
+            view_selection = window.findChild(QObject, 'viewCurrentSelection')
+            self.assertTrue(view_selection.property('visible'))
+            self.assertTrue(QMetaObject.invokeMethod(view_selection, 'click'))
+            selection_dialog = window.findChild(QObject, 'currentSelectionDialog')
+            wait_for(lambda: selection_dialog.property('visible'))
+            selection_list = window.findChild(QObject, 'currentSelectionList')
+            wait_for(lambda: self.find_visual_item(selection_list.property('contentItem'), 'currentSelectionItem') is not None)
+            content = selection_list.property('contentItem')
+            wait_for(lambda: any(
+                item.property('source').toString()
+                for item in self.find_visual_items(content, 'selectionItemArtwork')
+            ))
+            title = self.find_visual_item(content, 'currentSelectionItem')
+            self.assertIn('Album', [item.property('text') for item in self.all_visual_items(title)])
+            remove = self.find_visual_item(title, 'removeSelectionItem')
+            self.click_item(window, remove)
+            APP.processEvents()
+            self.assertEqual(window.property('selectedAlbums').toVariant(), [])
+            selection_dialog.close()
+
+            details = self.find_visual_item(grid.property('contentItem'), 'albumDetailsClickArea')
+            self.click_item(window, details)
+            dialog = window.findChild(QObject, 'albumDialog')
+            track_list = window.findChild(QObject, 'albumTracksList')
+            wait_for(lambda: self.find_visual_item(track_list.property('contentItem'), 'albumTrackItem') is not None)
+            track_item = self.find_visual_item(track_list.property('contentItem'), 'albumTrackItem')
+            self.click_item(window, track_item)
+            self.assertEqual(len(window.property('selectedTracks').toVariant()), 1)
+
+            view_tracks = window.findChild(QObject, 'viewCurrentSelectionFromTracks')
+            self.assertTrue(view_tracks.property('visible'))
+            self.click_item(window, view_tracks)
+            wait_for(lambda: selection_dialog.property('visible'))
+            wait_for(lambda: self.find_visual_item(selection_list.property('contentItem'), 'currentSelectionItem') is not None)
+            row = self.find_visual_item(selection_list.property('contentItem'), 'currentSelectionItem')
+            self.assertTrue(any(str(item.property('text')).startswith('Track ·')
+                                for item in self.all_visual_items(row)))
+            track_art = self.find_visual_item(row, 'selectionItemArtwork')
+            wait_for(lambda: bool(track_art.property('source').toString()))
+            self.click_item(window, self.find_visual_item(row, 'removeSelectionItem'))
+            APP.processEvents()
+            self.assertEqual(window.property('selectedTracks').toVariant(), [])
+        finally:
+            delete(engine)
+
+    def test_search_clear_button_clears_query(self):
+        engine = QQmlApplicationEngine()
+        try:
+            self.backend._source = ''
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            search = window.findChild(QObject, 'searchField')
+            clear_button = window.findChild(QObject, 'clearSearch')
+            self.assertIsNotNone(search)
+            self.assertIsNotNone(clear_button)
+            self.assertTrue(self.backend.clearButtonIcon.startswith('data:image/png;base64,'))
+            self.backend.setTheme('dark')
+            dark_icon_color = clear_button.property('themedClearColor')
+            self.assertEqual(dark_icon_color, window.property('ink'))
+            self.backend.setTheme('light')
+            light_icon_color = clear_button.property('themedClearColor')
+            self.assertEqual(light_icon_color, window.property('ink'))
+            self.assertNotEqual(dark_icon_color, light_icon_color)
+            self.assertEqual(clear_button.property('systemClearIcon').toString(), self.backend.clearButtonIcon)
+
+            search.setProperty('text', 'no matching album')
+            wait_for(lambda: clear_button.property('visible'))
+            wait_for(lambda: self.backend.album_model.count == 0)
+            self.assertTrue(QMetaObject.invokeMethod(clear_button, 'click'))
+            wait_for(lambda: search.property('text') == ''
+                     and self.backend.album_model.count > 0)
+            self.assertFalse(clear_button.property('visible'))
+        finally:
+            delete(engine)
+
+    def test_manual_refresh_button_is_always_visible_and_disabled_during_refresh(self):
+        engine = QQmlApplicationEngine()
+        try:
+            self.backend._source = ''
+            self.backend._refresh_on_startup = False
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            refresh = window.findChild(QObject, 'manualRefreshLibrary')
+            self.assertTrue(refresh.property('visible'))
+            self.assertFalse(refresh.property('enabled'))
+
+            self.backend._source = str(self.source)
+            self.backend.changed.emit()
+            self.assertTrue(refresh.property('enabled'))
+            self.backend._scanning = True
+            self.backend.libraryProgressChanged.emit()
+            self.assertTrue(refresh.property('visible'))
+            self.assertFalse(refresh.property('enabled'))
+            self.backend._scanning = False
+            self.backend.libraryProgressChanged.emit()
+            self.assertTrue(refresh.property('enabled'))
+            self.assertTrue(QMetaObject.invokeMethod(refresh, 'click'))
+            wait_for(lambda: not self.backend.scanning
+                     and self.backend.libraryStatus.startswith('Library up to date'))
+        finally:
+            delete(engine)
+
+    def test_unavailable_library_warning_appears_in_source_box(self):
+        engine = QQmlApplicationEngine()
+        try:
+            self.backend._source = ''
+            self.backend._source_available = False
+            self.backend._library_status = (
+                'Library is unavailable; saved index retained · saved library retained'
+            )
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            self.backend._source = str(self.source)
+            self.backend.changed.emit()
+            self.backend.sourceAvailabilityChanged.emit()
+            warning = window.findChild(QObject, 'sourceUnavailableMessage')
+            self.assertTrue(warning.property('visible'))
+            self.assertEqual(warning.property('text'), 'Library unavailable; saved library retained')
+            self.assertNotEqual(warning.property('color'), window.property('ink'))
+            self.assertEqual(window.findChild(QObject, 'libraryStatusMessage').property('text'),
+                             'Saved library retained')
+
+            self.backend._library_status = (
+                'Source changed and no tracks were found; saved library retained'
+            )
+            self.backend.libraryProgressChanged.emit()
+            self.assertTrue(warning.property('visible'))
+            self.backend.confirmSourceAvailable()
+            self.assertFalse(warning.property('visible'))
+            self.assertEqual(window.findChild(QObject, 'libraryStatusMessage').property('text'),
+                             'Source changed and no tracks were found; saved library retained')
         finally:
             delete(engine)
 
@@ -286,6 +472,12 @@ class UITests(AppFixture):
             engine.rootContext().setContextProperty('backend', self.backend)
             engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
             window = engine.rootObjects()[0]
+            dialog = window.findChild(QObject, 'settingsDialog')
+            QMetaObject.invokeMethod(dialog, 'open')
+            APP.processEvents()
+            category = window.findChild(QObject, 'settingsAppearanceCategory')
+            self.click_item(window, category)
+            APP.processEvents()
             picker = window.findChild(QObject, 'themePicker')
             self.assertIsNotNone(picker)
 

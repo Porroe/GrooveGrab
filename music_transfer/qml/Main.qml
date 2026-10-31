@@ -8,6 +8,7 @@ ApplicationWindow {
     width: 1380; height: 900; minimumWidth: 1000; minimumHeight: 650
     visible: true; title: "GrooveGrab"
     property bool dark: backend.theme === "dark" || (backend.theme === "system" && Qt.styleHints.colorScheme === Qt.Dark)
+    property bool sourceUnavailable: !!backend.source && !backend.sourceAvailable
     property color bg: dark ? "#11141b" : "#f4f6fa"
     property color panel: dark ? "#1c212c" : "#ffffff"
     property color ink: dark ? "#eef1fa" : "#202638"
@@ -15,6 +16,7 @@ ApplicationWindow {
     property color accent: dark ? "#b0a2ff" : "#6550cc"
     property var selectedAlbum: null
     property var selectedTracks: []
+    property var selectedTrackDetails: []
     property string contextAlbumId: ""
     property string artistFilter: "All artists"
     property string conflictKind: "same_path"
@@ -26,16 +28,62 @@ ApplicationWindow {
     onArtistFilterChanged: backend.setFilter(search.text, artistFilter)
     property var expandedAlbums: ({})
     property var selectedAlbums: []
+    property var selectedAlbumDetails: []
     property var collapsedFolders: ({})
-    function toggleAlbumSelection(id) {
+    function toggleAlbumSelection(album) {
         let ids = win.selectedAlbums.slice()
+        let details = win.selectedAlbumDetails.slice()
+        let id = album.id
         if (ids.indexOf(id) >= 0) ids = ids.filter(item => item !== id)
-        else ids.push(id)
+        else {
+            ids.push(id)
+            details.push({ kind: "album", id: id, title: album.title, subtitle: album.artist, cover: album.cover || "" })
+        }
+        if (ids.indexOf(id) < 0) details = details.filter(item => item.id !== id)
         win.selectedAlbums = ids
+        win.selectedAlbumDetails = details
+    }
+    function updateSelectedAlbumDetails(album) {
+        let details = win.selectedAlbumDetails.slice()
+        let index = details.findIndex(item => item.id === album.id)
+        if (index < 0 || details[index].cover === (album.cover || "")) return
+        details[index] = Object.assign({}, details[index], { cover: album.cover || "" })
+        win.selectedAlbumDetails = details
+    }
+    function toggleTrackSelection(track) {
+        let paths = win.selectedTracks.slice()
+        let details = win.selectedTrackDetails.slice()
+        if (paths.indexOf(track.path) >= 0) {
+            paths = paths.filter(path => path !== track.path)
+            details = details.filter(item => item.id !== track.path)
+        } else {
+            paths.push(track.path)
+            details.push({
+                kind: "track",
+                id: track.path,
+                title: track.display_title || track.title,
+                albumId: win.selectedAlbum ? win.selectedAlbum.id : "",
+                cover: win.selectedAlbum ? win.selectedAlbum.cover || "" : "",
+                subtitle: (win.selectedAlbum ? win.selectedAlbum.title : "") +
+                    (win.selectedAlbum && win.selectedAlbum.artist ? " · " + win.selectedAlbum.artist : "")
+            })
+        }
+        win.selectedTracks = paths
+        win.selectedTrackDetails = details
+    }
+    function removeSelection(item) {
+        if (item.kind === "album") {
+            win.selectedAlbums = win.selectedAlbums.filter(id => id !== item.id)
+            win.selectedAlbumDetails = win.selectedAlbumDetails.filter(row => row.id !== item.id)
+        } else {
+            win.selectedTracks = win.selectedTracks.filter(path => path !== item.id)
+            win.selectedTrackDetails = win.selectedTrackDetails.filter(row => row.id !== item.id)
+        }
     }
     function showAlbumTracks(album) {
         win.selectedAlbum = album
         win.selectedTracks = []
+        win.selectedTrackDetails = []
         backend.openAlbum(album.id)
         albumDialog.open()
     }
@@ -124,7 +172,7 @@ ApplicationWindow {
     FolderDialog { id: targetPicker; title: "Choose destination"; onAccepted: backend.chooseFolder(selectedFolder.toString(), false) }
     Connections {
         target: backend
-        function onLibraryReset() { win.selectedAlbums = []; win.selectedAlbum = null; win.selectedTracks = []; win.artistFilter = "All artists"; search.text = ""; artistPicker.currentIndex = 0 }
+        function onLibraryReset() { win.selectedAlbums = []; win.selectedAlbumDetails = []; win.selectedAlbum = null; win.selectedTracks = []; win.selectedTrackDetails = []; win.artistFilter = "All artists"; search.text = ""; artistPicker.currentIndex = 0 }
         function onNotify(message) { notice.text = message; toast.open() }
         function onConflict(path) { win.conflictKind = "same_path"; conflictPath.text = path; applyAll.checked = false; conflictDialog.open() }
         function onFormatConflict(kind, path, candidates) {
@@ -154,7 +202,12 @@ ApplicationWindow {
             onTriggered: backend.send(win.contextAlbumId, [])
         }
     }
-    Component.onCompleted: { if (backend.source) backend.rescan() }
+    Component.onCompleted: {
+        if (backend.source) {
+            if (backend.refreshOnStartup) backend.rescan()
+            else backend.loadSavedLibrary()
+        }
+    }
 
     ColumnLayout {
         enabled: !win.shuttingDown
@@ -167,14 +220,24 @@ ApplicationWindow {
                 Caption { text: "Your library. Ready to go." }
             }
             Item { Layout.fillWidth: true }
-            Picker { objectName: "themePicker"; model: ["System theme", "Light theme", "Dark theme"]; currentIndex: backend.theme === "light" ? 1 : backend.theme === "dark" ? 2 : 0; onActivated: backend.setTheme(["system", "light", "dark"][currentIndex]) }
             Action { text: "Settings"; onClicked: settingsDialog.open() }
         }
         RowLayout {
             Layout.fillWidth: true; spacing: 14
-            Rectangle { Layout.fillWidth: true; height: 76; radius: 12; color: win.panel
+            Rectangle { Layout.fillWidth: true; height: win.sourceUnavailable ? 94 : 76; radius: 12; color: win.panel
                 RowLayout { anchors.fill: parent; anchors.margins: 14
-                    ColumnLayout { Layout.fillWidth: true; Caption { text: "SOURCE LIBRARY · READ ONLY" } Label { Layout.fillWidth: true; text: backend.source || "Choose your music folder"; color: win.ink; elide: Text.ElideMiddle } }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 1
+                        Caption { text: "SOURCE LIBRARY · READ ONLY" }
+                        Label { Layout.fillWidth: true; text: backend.source || "Choose your music folder"; color: win.ink; elide: Text.ElideMiddle }
+                        Label {
+                            objectName: "sourceUnavailableMessage"
+                            Layout.fillWidth: true; visible: win.sourceUnavailable
+                            text: "Library unavailable; saved library retained"
+                            color: win.dark ? "#ff7777" : "#c62828"
+                            font.pixelSize: 11; elide: Text.ElideRight
+                        }
+                    }
                     Action { text: "Browse"; enabled: !backend.running && !backend.scanning; onClicked: sourcePicker.open() }
                 }
             }
@@ -191,7 +254,31 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true; Layout.fillHeight: true; spacing: 14
                 RowLayout {
-                    Entry { id: search; implicitHeight: 40; Layout.fillWidth: true; placeholderText: "Search albums, artists, or songs…"; selectByMouse: true; onTextChanged: backend.setFilter(text, win.artistFilter) }
+                    Item {
+                        Layout.fillWidth: true; implicitHeight: 40
+                        Entry {
+                            id: search; objectName: "searchField"
+                            anchors.fill: parent
+                            rightPadding: 42
+                            placeholderText: "Search albums, artists, or songs…"
+                            selectByMouse: true
+                            onTextChanged: backend.setFilter(text, win.artistFilter)
+                        }
+                        ToolButton {
+                            objectName: "clearSearch"
+                            property url systemClearIcon: backend.clearButtonIcon
+                            property color themedClearColor: win.ink
+                            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
+                            width: 40; height: 40; visible: search.text.length > 0
+                            icon.source: systemClearIcon
+                            icon.color: themedClearColor
+                            icon.width: 16; icon.height: 16
+                            display: AbstractButton.IconOnly
+                            Accessible.name: "Clear search"
+                            ToolTip.text: "Clear search"; ToolTip.visible: hovered
+                            onClicked: search.clear()
+                        }
+                    }
                     Picker {
                         id: artistPicker; objectName: "artistPicker"
                         Layout.preferredWidth: 160
@@ -199,17 +286,23 @@ ApplicationWindow {
                         onActivated: win.artistFilter = currentText
                     }
                     Action { text: win.folderMode ? "Albums" : "Folders"; onClicked: win.folderMode = !win.folderMode }
-                    Action { text: "↻"; enabled: !backend.running && !backend.scanning; onClicked: backend.rescan(); ToolTip.text: "Rescan library"; ToolTip.visible: hovered }
+                    Action {
+                        objectName: "manualRefreshLibrary"
+                        text: "Refresh library"
+                        enabled: !!backend.source && !backend.scanning
+                        onClicked: backend.rescan()
+                    }
                 }
                 RowLayout {
-                    Action { visible: win.selectedAlbums.length > 0; text: "Send selected albums (" + win.selectedAlbums.length + ")"; enabled: !!backend.target; onClicked: { backend.sendAlbums(win.selectedAlbums); win.selectedAlbums = [] } }
-                    Action { objectName: "clearAlbumSelection"; visible: win.selectedAlbums.length > 0; text: "Clear selection"; onClicked: win.selectedAlbums = [] }
+                    Action { visible: win.selectedAlbums.length > 0; text: "Send selected albums (" + win.selectedAlbums.length + ")"; enabled: !!backend.target; onClicked: { backend.sendAlbums(win.selectedAlbums); win.selectedAlbums = []; win.selectedAlbumDetails = [] } }
+                    Action { objectName: "viewCurrentSelection"; visible: win.selectedAlbums.length + win.selectedTracks.length > 0; text: "View current selection (" + (win.selectedAlbums.length + win.selectedTracks.length) + ")"; onClicked: currentSelectionDialog.open() }
+                    Action { objectName: "clearAlbumSelection"; visible: win.selectedAlbums.length > 0; text: "Clear selection"; onClicked: { win.selectedAlbums = []; win.selectedAlbumDetails = [] } }
                     Label { text: backend.albums.count + " albums"; color: win.muted }
                 }
                 RowLayout {
                     Layout.fillWidth: true
                     BusyIndicator { running: backend.scanning && backend.libraryTotal === 0; visible: running; implicitWidth: 26; implicitHeight: 26 }
-                    Caption { Layout.fillWidth: true; text: backend.libraryStatus; elide: Text.ElideRight }
+                    Caption { objectName: "libraryStatusMessage"; Layout.fillWidth: true; text: win.sourceUnavailable ? "Saved library retained" : backend.libraryStatus; elide: Text.ElideRight }
                     Action { text: "Cancel refresh"; visible: backend.scanning; onClicked: backend.cancelScan() }
                 }
                 Meter { Layout.fillWidth: true; visible: backend.scanning && backend.libraryTotal > 0; value: backend.libraryProgress }
@@ -222,8 +315,14 @@ ApplicationWindow {
                     delegate: Item {
                         required property var modelData
                         width: grid.cellWidth; height: grid.cellHeight
-                        Component.onCompleted: backend.requestCover(modelData.id)
-                        onModelDataChanged: if (!modelData.cover) backend.requestCover(modelData.id)
+                        Component.onCompleted: {
+                            backend.requestCover(modelData.id)
+                            win.updateSelectedAlbumDetails(modelData)
+                        }
+                        onModelDataChanged: {
+                            if (!modelData.cover) backend.requestCover(modelData.id)
+                            win.updateSelectedAlbumDetails(modelData)
+                        }
                         TapHandler {
                             acceptedButtons: Qt.RightButton
                             onTapped: {
@@ -244,7 +343,7 @@ ApplicationWindow {
                                     MouseArea {
                                         objectName: "albumArtworkClickArea"
                                         anchors.fill: parent; cursorShape: Qt.PointingHandCursor
-                                        onClicked: win.toggleAlbumSelection(modelData.id)
+                                        onClicked: win.toggleAlbumSelection(modelData)
                                         ToolTip.visible: containsMouse
                                         ToolTip.text: "Select album"
                                         hoverEnabled: true
@@ -273,7 +372,7 @@ ApplicationWindow {
                                 objectName: "albumSelectionCheckbox"
                                 anchors.right: parent.right; anchors.top: parent.top; anchors.margins: 8
                                 checked: win.selectedAlbums.indexOf(modelData.id) >= 0
-                                onToggled: win.toggleAlbumSelection(modelData.id)
+                                onToggled: win.toggleAlbumSelection(modelData)
                             }
                         border.width: activeFocus || win.selectedAlbums.indexOf(modelData.id) >= 0 ? 2 : 0; border.color: win.accent
                         activeFocusOnTab: true
@@ -400,29 +499,102 @@ ApplicationWindow {
                     width: ListView.view.width
                     text: modelData.display_title || modelData.title
                     checked: win.selectedTracks.indexOf(modelData.path) >= 0
-                    onToggled: { let paths = win.selectedTracks.slice(); if (checked) paths.push(modelData.path); else paths = paths.filter(p => p !== modelData.path); win.selectedTracks = paths }
+                    onToggled: win.toggleTrackSelection(modelData)
                 }
                 ScrollBar.vertical: ScrollBar {}
             }
             RowLayout {
-                Action { text: "Send album"; enabled: !!backend.target; onClicked: { backend.send(win.selectedAlbum.id, []); albumDialog.close() } }
-                Action { text: "Send selected (" + win.selectedTracks.length + ")"; enabled: !!backend.target && win.selectedTracks.length > 0; onClicked: { backend.send(win.selectedAlbum.id, win.selectedTracks); albumDialog.close() } }
+                Action { text: "Send album"; enabled: !!backend.target; onClicked: { backend.send(win.selectedAlbum.id, []); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
+                Action { text: "Send selected (" + win.selectedTracks.length + ")"; enabled: !!backend.target && win.selectedTracks.length > 0; onClicked: { backend.send(win.selectedAlbum.id, win.selectedTracks); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
+                Action { objectName: "viewCurrentSelectionFromTracks"; visible: win.selectedAlbums.length + win.selectedTracks.length > 0; text: "View current selection"; onClicked: currentSelectionDialog.open() }
                 Item { Layout.fillWidth: true }
                 Action { text: "Close"; onClicked: albumDialog.close() }
             }
         }
     }
     Sheet {
+        id: currentSelectionDialog; objectName: "currentSelectionDialog"; anchors.centerIn: parent
+        width: Math.min(win.width - 64, 620); height: Math.min(win.height - 64, 620); modal: true
+        ColumnLayout {
+            anchors.fill: parent; spacing: 12
+            Label { text: "Current selection"; color: win.ink; font.pixelSize: 21; font.bold: true }
+            Caption { text: currentSelectionList.count + (currentSelectionList.count === 1 ? " item selected" : " items selected") }
+            ListView {
+                id: currentSelectionList; objectName: "currentSelectionList"
+                Layout.fillWidth: true; Layout.fillHeight: true; clip: true; spacing: 6
+                model: win.selectedAlbumDetails.concat(win.selectedTrackDetails)
+                delegate: Rectangle {
+                    objectName: "currentSelectionItem"
+                    required property var modelData
+                    width: ListView.view.width; height: 58; radius: 9; color: win.dark ? "#252b39" : "#f0eef8"
+                    RowLayout {
+                        anchors.fill: parent; anchors.margins: 10; spacing: 10
+                        Rectangle {
+                            Layout.preferredWidth: 42; Layout.preferredHeight: 42
+                            radius: 5; clip: true
+                            color: win.dark ? "#353d52" : "#e2dff0"
+                            Image {
+                                id: selectionArtwork
+                                objectName: "selectionItemArtwork"
+                                anchors.fill: parent
+                                source: modelData.cover || (win.selectedAlbum &&
+                                    ((modelData.kind === "track" && modelData.albumId === win.selectedAlbum.id) ||
+                                     (modelData.kind === "album" && modelData.id === win.selectedAlbum.id))
+                                    ? backend.selectedAlbumCover : "")
+                                fillMode: Image.PreserveAspectCrop
+                                asynchronous: true
+                            }
+                            Label {
+                                anchors.centerIn: parent
+                                text: "♫"; color: win.accent; font.pixelSize: 20
+                                visible: selectionArtwork.status !== Image.Ready
+                            }
+                        }
+                        ColumnLayout {
+                            Layout.fillWidth: true; spacing: 2
+                            Label { Layout.fillWidth: true; text: modelData.title; color: win.ink; font.bold: true; elide: Text.ElideRight }
+                            Caption { Layout.fillWidth: true; text: (modelData.kind === "album" ? "Album" : "Track") + (modelData.subtitle ? " · " + modelData.subtitle : ""); elide: Text.ElideRight }
+                        }
+                        Action {
+                            objectName: "removeSelectionItem"
+                            text: "Remove"
+                            onClicked: win.removeSelection(modelData)
+                        }
+                    }
+                }
+                Label { anchors.centerIn: parent; visible: !currentSelectionList.count; text: "Nothing selected"; color: win.muted }
+            }
+            RowLayout {
+                Action {
+                    text: "Clear selection"
+                    enabled: currentSelectionList.count > 0
+                    onClicked: {
+                        win.selectedAlbums = []
+                        win.selectedAlbumDetails = []
+                        win.selectedTracks = []
+                        win.selectedTrackDetails = []
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                Action { text: "Close"; onClicked: currentSelectionDialog.close() }
+            }
+        }
+    }
+    Sheet {
         id: settingsDialog; objectName: "settingsDialog"; anchors.centerIn: parent
         property string category: "Files"
+        property string draftTheme: "system"
         property string draftConflictPolicy: "ask_every_time"
         property string draftFormatPolicy: "ask_every_time"
         property string draftSameFormatPolicy: "ask_every_time"
+        property bool draftRefreshOnStartup: true
         width: Math.min(win.width - 80, 900); height: Math.min(win.height - 80, 580); modal: true
         function resetDrafts() {
+            draftTheme = backend.theme
             draftConflictPolicy = backend.conflictPolicy
             draftFormatPolicy = backend.formatPolicy
             draftSameFormatPolicy = backend.sameFormatPolicy
+            draftRefreshOnStartup = backend.refreshOnStartup
             artEnabled.checked = backend.artwork.enabled
             artName.text = backend.artwork.filename
             artWidth.value = backend.artwork.width
@@ -476,6 +648,36 @@ ApplicationWindow {
                             leftPadding: 12
                         }
                     }
+                    Button {
+                        objectName: "settingsLibraryCategory"
+                        Layout.fillWidth: true
+                        text: "Library"
+                        onClicked: settingsDialog.category = "Library"
+                        background: Rectangle {
+                            radius: 8
+                            color: settingsDialog.category === "Library" ? (win.dark ? "#333b50" : "#e8e5f5") : "transparent"
+                        }
+                        contentItem: Text {
+                            text: parent.text; color: win.ink; font.pixelSize: 14
+                            horizontalAlignment: Text.AlignLeft; verticalAlignment: Text.AlignVCenter
+                            leftPadding: 12
+                        }
+                    }
+                    Button {
+                        objectName: "settingsAppearanceCategory"
+                        Layout.fillWidth: true
+                        text: "Appearance"
+                        onClicked: settingsDialog.category = "Appearance"
+                        background: Rectangle {
+                            radius: 8
+                            color: settingsDialog.category === "Appearance" ? (win.dark ? "#333b50" : "#e8e5f5") : "transparent"
+                        }
+                        contentItem: Text {
+                            text: parent.text; color: win.ink; font.pixelSize: 14
+                            horizontalAlignment: Text.AlignLeft; verticalAlignment: Text.AlignVCenter
+                            leftPadding: 12
+                        }
+                    }
                     Item { Layout.fillHeight: true }
                 }
                 Rectangle {
@@ -486,7 +688,9 @@ ApplicationWindow {
                     objectName: "settingsOptions"
                     Layout.fillWidth: true; Layout.fillHeight: true
                     Layout.leftMargin: 20
-                    currentIndex: settingsDialog.category === "Files" ? 0 : 1
+                    currentIndex: settingsDialog.category === "Files" ? 0
+                        : settingsDialog.category === "Artwork" ? 1
+                        : settingsDialog.category === "Library" ? 2 : 3
                     ColumnLayout {
                         objectName: "settingsFilesPane"
                         spacing: 12
@@ -516,7 +720,6 @@ ApplicationWindow {
                             onActivated: settingsDialog.draftSameFormatPolicy = ["always_copy", "keep_existing", "replace_existing", "ask_every_time"][currentIndex]
                         }
                         Item { Layout.fillHeight: true }
-                        Action { text: "Clear thumbnail cache"; onClicked: backend.clearCache() }
                     }
                     ColumnLayout {
                         objectName: "settingsArtworkPane"
@@ -535,6 +738,38 @@ ApplicationWindow {
                         Caption { Layout.fillWidth: true; text: "Preserves proportions. Never enlarges smaller images."; wrapMode: Text.Wrap }
                         Item { Layout.fillHeight: true }
                     }
+                    ColumnLayout {
+                        objectName: "settingsLibraryPane"
+                        spacing: 12
+                        Label { text: "Library"; color: win.ink; font.pixelSize: 17; font.bold: true }
+                        CheckBox {
+                            objectName: "refreshLibraryOnStartup"
+                            text: "Refresh library on startup"
+                            checked: settingsDialog.draftRefreshOnStartup
+                            onToggled: settingsDialog.draftRefreshOnStartup = checked
+                        }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "When disabled, GrooveGrab loads the saved library index at startup. Use Refresh library to check for changes."
+                            wrapMode: Text.Wrap
+                        }
+                        Action { objectName: "clearThumbnailCache"; text: "Clear thumbnail cache"; onClicked: backend.clearCache() }
+                        Item { Layout.fillHeight: true }
+                    }
+                    ColumnLayout {
+                        objectName: "settingsAppearancePane"
+                        spacing: 12
+                        Label { text: "Appearance"; color: win.ink; font.pixelSize: 17; font.bold: true }
+                        Label { text: "Theme"; color: win.ink }
+                        Picker {
+                            objectName: "themePicker"
+                            Layout.fillWidth: true
+                            model: ["System theme", "Light theme", "Dark theme"]
+                            currentIndex: ["system", "light", "dark"].indexOf(settingsDialog.draftTheme)
+                            onActivated: settingsDialog.draftTheme = ["system", "light", "dark"][currentIndex]
+                        }
+                        Item { Layout.fillHeight: true }
+                    }
                 }
             }
             RowLayout {
@@ -549,12 +784,17 @@ ApplicationWindow {
                     objectName: "settingsSave"
                     text: "Save settings"
                     onClicked: {
-                        if (backend.saveSettings(settingsDialog.draftConflictPolicy,
+                        if (backend.saveSettings(settingsDialog.draftTheme,
+                                                 settingsDialog.draftConflictPolicy,
                                                  settingsDialog.draftFormatPolicy,
                                                  settingsDialog.draftSameFormatPolicy,
+                                                 settingsDialog.draftRefreshOnStartup,
                                                  artEnabled.checked, artName.text,
-                                                 artWidth.value, artHeight.value))
+                                                 artWidth.value, artHeight.value)) {
                             settingsDialog.close()
+                            settingsSavedToast.open()
+                            settingsToastTimer.restart()
+                        }
                     }
                 }
             }
@@ -612,5 +852,32 @@ ApplicationWindow {
     Rectangle { anchors.centerIn: parent; visible: win.shuttingDown; width: 360; height: 100; radius: 16; color: win.panel; z: 100; Label { anchors.centerIn: parent; text: "Finishing transfers and closing…"; color: win.ink } }
     Popup { id: toast; anchors.centerIn: parent; width: Math.min(win.width - 80, 580); height: Math.max(160, notice.implicitHeight + 110); modal: true; padding: 24; closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
         ColumnLayout { anchors.fill: parent; Label { id: notice; Layout.fillWidth: true; wrapMode: Text.Wrap; color: win.ink } Action { text: "OK"; onClicked: toast.close() } }
+    }
+    Popup {
+        id: settingsSavedToast
+        objectName: "settingsSavedToast"
+        x: (win.width - width) / 2
+        y: win.height - height - 24
+        width: Math.min(win.width - 48, 320)
+        height: 54
+        modal: false
+        padding: 14
+        closePolicy: Popup.NoAutoClose
+        background: Rectangle {
+            radius: 10
+            color: win.panel
+            border.color: win.dark ? "#374057" : "#dce1ed"
+        }
+        contentItem: Label {
+            text: "Settings saved."
+            color: win.ink
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+        }
+    }
+    Timer {
+        id: settingsToastTimer
+        interval: 2200
+        onTriggered: settingsSavedToast.close()
     }
 }
