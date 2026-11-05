@@ -2,7 +2,7 @@ import os
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 from pathlib import Path
 import unittest
-from PySide6.QtCore import QObject, QMetaObject, QPoint, QPointF, QUrl, Qt, qInstallMessageHandler
+from PySide6.QtCore import QObject, QMetaObject, QPoint, QPointF, QUrl, Qt, Q_ARG, qInstallMessageHandler
 from PySide6.QtQml import QQmlApplicationEngine
 from PySide6.QtQuick import QQuickWindow
 from PySide6.QtTest import QTest
@@ -12,6 +12,43 @@ from test_app import APP, AppFixture, make_wave, snapshot, wait_for
 
 
 class UITests(AppFixture):
+    def test_settings_edit_multiple_artwork_profiles_and_remove_a_destination(self):
+        engine = QQmlApplicationEngine()
+        try:
+            first, second = str(self.target), str(self.root / 'other')
+            self.backend.saveArtwork(True, 'cover.jpg', 200, 200)
+            self.backend.accept_folder((second, False, False))
+            self.backend._source = ''
+            engine.rootContext().setContextProperty('backend', self.backend)
+            engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
+            window = engine.rootObjects()[0]
+            dialog = window.findChild(QObject, 'settingsDialog')
+            QMetaObject.invokeMethod(dialog, 'open')
+            APP.processEvents()
+            self.click_item(window, window.findChild(QObject, 'settingsArtworkCategory'))
+            picker = window.findChild(QObject, 'artworkDestinationPicker')
+            width = window.findChild(QObject, 'artworkWidth')
+            self.assertEqual(picker.property('currentText'), second)
+            width.setProperty('value', 350)
+            self.assertTrue(QMetaObject.invokeMethod(picker, 'activated', Q_ARG(int, 1)))
+            self.assertEqual(width.property('value'), 200)
+            width.setProperty('value', 250)
+            self.click_item(window, window.findChild(QObject, 'settingsSave'))
+            wait_for(lambda: not dialog.property('visible'))
+            self.assertEqual(self.backend.artworkForTarget(first)['width'], 250)
+            self.assertEqual(self.backend.artworkForTarget(second)['width'], 350)
+            self.assertEqual(self.backend.target, second)
+
+            QMetaObject.invokeMethod(dialog, 'open')
+            APP.processEvents()
+            self.click_item(window, window.findChild(QObject, 'settingsDestinationsCategory'))
+            pane = window.findChild(QObject, 'settingsDestinationsPane')
+            wait_for(lambda: self.find_visual_item(pane, 'removeSavedDestination') is not None)
+            self.click_item(window, self.find_visual_item(pane, 'removeSavedDestination'))
+            self.assertEqual(self.backend.savedTargets, [second])
+        finally:
+            delete(engine)
+
     def click_item(self, window, item, button=Qt.LeftButton):
         point = item.mapToScene(QPointF(item.width() / 2, item.height() / 2))
         QTest.mouseClick(window, button, Qt.NoModifier, QPoint(round(point.x()), round(point.y())))
@@ -51,7 +88,6 @@ class UITests(AppFixture):
             engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
             self.assertTrue(engine.rootObjects())
             window = engine.rootObjects()[0]
-            wait_for(lambda: window.findChild(QObject, 'artistPicker').property('currentText') == 'All artists')
             self.backend._source = str(self.source)
             self.backend.changed.emit()
             for theme in ('dark', 'light', 'system'):
@@ -166,8 +202,6 @@ class UITests(AppFixture):
                     self.assertFalse(dialog.property('visible'))
                 else:
                     QMetaObject.invokeMethod(dialog, 'close')
-            window.setProperty('folderMode', True)
-            APP.processEvents()
         finally:
             delete(engine)
             qInstallMessageHandler(previous)
@@ -286,7 +320,7 @@ class UITests(AppFixture):
         finally:
             delete(engine)
 
-    def test_search_clear_button_clears_query(self):
+    def test_clear_search_button_clears_query(self):
         engine = QQmlApplicationEngine()
         try:
             self.backend._source = ''
@@ -295,25 +329,15 @@ class UITests(AppFixture):
             window = engine.rootObjects()[0]
             search = window.findChild(QObject, 'searchField')
             clear_button = window.findChild(QObject, 'clearSearch')
-            self.assertIsNotNone(search)
-            self.assertIsNotNone(clear_button)
-            self.assertTrue(self.backend.clearButtonIcon.startswith('data:image/png;base64,'))
-            self.backend.setTheme('dark')
-            dark_icon_color = clear_button.property('themedClearColor')
-            self.assertEqual(dark_icon_color, window.property('ink'))
-            self.backend.setTheme('light')
-            light_icon_color = clear_button.property('themedClearColor')
-            self.assertEqual(light_icon_color, window.property('ink'))
-            self.assertNotEqual(dark_icon_color, light_icon_color)
-            self.assertEqual(clear_button.property('systemClearIcon').toString(), self.backend.clearButtonIcon)
-
+            self.assertFalse(clear_button.isVisible())
             search.setProperty('text', 'no matching album')
-            wait_for(lambda: clear_button.property('visible'))
-            wait_for(lambda: self.backend.album_model.count == 0)
-            self.assertTrue(QMetaObject.invokeMethod(clear_button, 'click'))
+            wait_for(lambda: clear_button.isVisible() and self.backend.album_model.count == 0)
+            self.assertLessEqual(search.x() + search.width(), clear_button.x())
+            self.click_item(window, clear_button)
             wait_for(lambda: search.property('text') == ''
                      and self.backend.album_model.count > 0)
-            self.assertFalse(clear_button.property('visible'))
+            self.assertFalse(clear_button.isVisible())
+            self.assertTrue(search.property('activeFocus'))
         finally:
             delete(engine)
 
@@ -394,7 +418,7 @@ class UITests(AppFixture):
             menu_item = window.findChild(QObject, 'copyAlbumMenuItem')
             wait_for(lambda: menu.property('visible'))
             self.assertEqual(menu_item.property('text'), 'Copy this album')
-            self.assertTrue(menu_item.property('enabled'))
+            wait_for(lambda: menu_item.property('enabled'))
             self.assertEqual(window.property('contextAlbumId'), self.album['id'])
             self.assertEqual(window.property('selectedAlbums').toVariant(), [])
         finally:
@@ -533,7 +557,6 @@ class UITests(AppFixture):
             engine.rootContext().setContextProperty('backend', self.backend)
             engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
             window = engine.rootObjects()[0]
-            wait_for(lambda: window.findChild(QObject, 'artistPicker').property('currentText') == 'All artists')
             self.backend._source = str(self.source)
             existing = self.target / 'Artist/Album/01.wav'
             existing.parent.mkdir(parents=True)
@@ -558,7 +581,6 @@ class UITests(AppFixture):
             engine.rootContext().setContextProperty('backend', self.backend)
             engine.load(QUrl.fromLocalFile(str(Path(__file__).resolve().parents[1] / 'music_transfer/qml/Main.qml')))
             window = engine.rootObjects()[0]
-            wait_for(lambda: window.findChild(QObject, 'artistPicker').property('currentText') == 'All artists')
             self.backend._source = str(self.source)
             previous = self.target / 'Artist' / 'Album' / '01.mp3'
             make_wave(previous, number='01')

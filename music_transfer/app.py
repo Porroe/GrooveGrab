@@ -1,24 +1,25 @@
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+from stat import S_ISDIR
 import sys
 import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
-from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl, QSettings, QTimer, QBuffer, QIODevice
-from PySide6.QtGui import QGuiApplication
+from PySide6.QtCore import QObject, Signal, Slot, Property, QUrl, QSettings, QTimer
+from PySide6.QtGui import QGuiApplication, QIcon
 from PySide6.QtQml import QQmlApplicationEngine
-from PySide6.QtWidgets import QStyle, QStyleFactory
 from .core import (ArtworkSettings, ThumbnailCache, overlaps, destination,
-                   copy_audio, atomic_write, cover_image, jpeg_bytes, read_track, EXTENSIONS, Cancelled)
+                   copy_audio, atomic_write, cover_image, jpeg_bytes, regenerate_cover,
+                   read_track, EXTENSIONS, Cancelled)
 from .database import LibraryIndex, database_path
 from .models import RecordModel
 
@@ -71,20 +72,6 @@ def fingerprint(album):
     return hashlib.sha256(json.dumps([(t['path'], t.get('size'), t.get('mtime_ns')) for t in album['tracks']]).encode()).hexdigest()
 
 
-def clear_button_icons():
-    style_name = {'darwin': 'macOS', 'win32': 'Windows'}.get(sys.platform, 'Fusion')
-    style = QStyleFactory.create(style_name) or QStyleFactory.create('Fusion')
-    if style is None:
-        raise RuntimeError('Could not load a Qt style for the search clear icon.')
-    icon = style.standardIcon(QStyle.SP_LineEditClearButton)
-    if icon.isNull():
-        raise RuntimeError('Qt did not provide a standard search clear icon.')
-    buffer = QBuffer()
-    if not buffer.open(QIODevice.WriteOnly) or not icon.pixmap(32, 32).save(buffer, 'PNG'):
-        raise RuntimeError('Could not render the standard search clear icon.')
-    return 'data:image/png;base64,' + base64.b64encode(bytes(buffer.data())).decode('ascii')
-
-
 class Backend(QObject):
     changed = Signal()
     libraryChanged = Signal()
@@ -101,12 +88,20 @@ class Backend(QObject):
     coverReady = Signal(object)
     cacheCleared = Signal()
     shutdownFinished = Signal()
+    artworkResizeFinished = Signal(str)
+    artworkResizeAdvanced = Signal(int, int)
 
     def __init__(self, index_path=None):
         super().__init__()
         self.settings = QSettings('MusicTransfer', 'MusicTransfer')
         self._source = self.settings.value('source', '')
+        self._saved_sources = self.settings.value('sources', [], type=list)
+        if self._source and self._source not in self._saved_sources:
+            self._saved_sources.append(self._source)
         self._target = self.settings.value('target', '')
+        self._target_availability = None
+        self._target_check = None
+        self._next_target_check = 0
         self._theme = self.settings.value('theme', 'system')
         conflict_policy = self.settings.value('conflict_policy', 'ask_every_time')
         self._conflict_policy = conflict_policy if conflict_policy in CONFLICT_POLICIES else 'ask_every_time'
@@ -116,7 +111,18 @@ class Backend(QObject):
         self._same_format_policy = same_format_policy if same_format_policy in SAME_FORMAT_POLICIES else 'ask_every_time'
         self._refresh_on_startup = self.settings.value('refresh_on_startup', True, type=bool)
         self._art = ArtworkSettings(**json.loads(self.settings.value('artwork', '{}')))
-        self._clear_button_icon = clear_button_icons()
+        profiles = self.settings.value('target_artwork')
+        if profiles is None:
+            self._target_artwork = {
+                path: replace(self._art, width=width, height=height)
+                for path, (width, height) in json.loads(self.settings.value('target_sizes', '{}')).items()
+            }
+        else:
+            self._target_artwork = {
+                path: ArtworkSettings(**artwork) for path, artwork in json.loads(profiles).items()
+            }
+        if self._target:
+            self._target_artwork.setdefault(self._target, self._art)
         self.index_path = Path(index_path or database_path())
         self._albums, self._queue, self._results = [], [], []
         self.catalog = {}
@@ -124,6 +130,9 @@ class Backend(QObject):
         self._album_totals, self._album_done = {}, {}
         self._scanning = self._running = self._paused = False
         self._preparing = 0
+        self._resizing_artwork = False
+        self._artwork_resize_status = ''
+        self._artwork_resize_done = self._artwork_resize_total = 0
         self._progress = 0.0
         self._status = 'Ready to transfer music'
         self._library_status = 'Choose your music library to get started'
@@ -187,11 +196,17 @@ class Backend(QObject):
         self._shutdown_started = False
         self._shutdown_complete = False
         self.sourceAccessConfirmed.connect(self.confirmSourceAvailable)
+        self.artworkResizeFinished.connect(self.finish_artwork_resize)
+        self.artworkResizeAdvanced.connect(self.update_artwork_resize)
 
     shutdownComplete = Property(bool, lambda s: s._shutdown_complete, notify=shutdownFinished)
     sourceAvailable = Property(bool, lambda s: s._source_available, notify=sourceAvailabilityChanged)
     source = Property(str, lambda s: s._source, notify=changed)
+    savedSources = Property('QStringList', lambda s: s._saved_sources, notify=changed)
     target = Property(str, lambda s: s._target, notify=changed)
+    targetAvailable = Property(bool, lambda s: s._target_availability is True, notify=changed)
+    targetUnavailable = Property(bool, lambda s: s._target_availability is False, notify=changed)
+    savedTargets = Property('QStringList', lambda s: list(s._target_artwork), notify=changed)
     theme = Property(str, lambda s: s._theme, notify=changed)
     conflictPolicy = Property(str, lambda s: s._conflict_policy, notify=changed)
     formatPolicy = Property(str, lambda s: s._format_policy, notify=changed)
@@ -204,19 +219,42 @@ class Backend(QObject):
     queue = Property(QObject, lambda s: s.queue_model, constant=True)
     results = Property(QObject, lambda s: s.history_model, constant=True)
     scanning = Property(bool, lambda s: s._scanning, notify=libraryProgressChanged)
-    running = Property(bool, lambda s: s._running or s._preparing > 0, notify=changed)
+    running = Property(bool, lambda s: s._running or s._preparing > 0 or s._resizing_artwork, notify=changed)
+    artworkResizeStatus = Property(str, lambda s: s._artwork_resize_status, notify=changed)
+    resizingArtwork = Property(bool, lambda s: s._resizing_artwork, notify=changed)
+    artworkResizeDone = Property(int, lambda s: s._artwork_resize_done, notify=changed)
+    artworkResizeTotal = Property(int, lambda s: s._artwork_resize_total, notify=changed)
     paused = Property(bool, lambda s: s._paused, notify=changed)
     conflictCount = Property(int, lambda s: len(s._conflicts), notify=changed)
     progress = Property(float, lambda s: s._progress, notify=changed)
     status = Property(str, lambda s: s._status, notify=changed)
-    artwork = Property('QVariantMap', lambda s: asdict(s._art), notify=changed)
-    clearButtonIcon = Property(str, lambda s: s._clear_button_icon, constant=True)
+    artwork = Property('QVariantMap', lambda s: asdict(s.target_artwork()), notify=changed)
     selectedAlbumCover = Property(str, lambda s: s.selected_album_cover(), notify=selectedAlbumCoverChanged)
     libraryStatus = Property(str, lambda s: s._library_status, notify=libraryProgressChanged)
     libraryStage = Property(str, lambda s: s._library_stage, notify=libraryProgressChanged)
     libraryDone = Property(int, lambda s: s._library_done, notify=libraryProgressChanged)
     libraryTotal = Property(int, lambda s: s._library_total, notify=libraryProgressChanged)
     libraryProgress = Property(float, lambda s: s._library_progress, notify=libraryProgressChanged)
+
+    def target_artwork(self):
+        return self._target_artwork.get(self._target, self._art)
+
+    @Slot(str, result='QVariantMap')
+    def artworkForTarget(self, path):
+        return asdict(self._target_artwork.get(path, self._art))
+
+    def persist_target_artwork(self):
+        self.settings.setValue('target_artwork', json.dumps({
+            path: asdict(artwork) for path, artwork in self._target_artwork.items()
+        }))
+
+    def store_artwork(self, artwork, path):
+        if path:
+            self._target_artwork[path] = artwork
+            self.persist_target_artwork()
+        else:
+            self._art = artwork
+            self.settings.setValue('artwork', json.dumps(asdict(artwork)))
 
     @Slot(str)
     def setTheme(self, theme):
@@ -252,9 +290,10 @@ class Backend(QObject):
         self.changed.emit()
 
     @Slot(str, str, str, str, bool, bool, str, int, int, result=bool)
+    @Slot(str, str, str, str, bool, 'QVariantMap', result=bool)
     def saveSettings(self, theme, conflict_policy, format_policy, same_format_policy,
-                     refresh_on_startup, artwork_enabled, artwork_filename,
-                     artwork_width, artwork_height):
+                     refresh_on_startup, artwork_settings, artwork_filename=None,
+                     artwork_width=None, artwork_height=None):
         if theme not in ('system', 'light', 'dark'):
             self.notify.emit('Choose a valid theme.')
             return False
@@ -268,8 +307,15 @@ class Backend(QObject):
             self.notify.emit('Choose a valid same-format setting.')
             return False
         try:
-            artwork = ArtworkSettings(artwork_enabled, artwork_filename, artwork_width, artwork_height)
-            artwork.validate()
+            if artwork_filename is None:
+                drafts = {path: ArtworkSettings(**values) for path, values in artwork_settings.items()}
+            else:
+                drafts = {self._target: ArtworkSettings(
+                    artwork_settings, artwork_filename, artwork_width, artwork_height)}
+            for path, artwork in drafts.items():
+                if path and path != self._target and path not in self._target_artwork:
+                    raise ValueError('Choose a saved destination.')
+                artwork.validate()
         except ValueError as error:
             self.notify.emit(str(error))
             return False
@@ -279,13 +325,13 @@ class Backend(QObject):
         self._format_policy = format_policy
         self._same_format_policy = same_format_policy
         self._refresh_on_startup = refresh_on_startup
-        self._art = artwork
+        for path, artwork in drafts.items():
+            self.store_artwork(artwork, path)
         self.settings.setValue('theme', theme)
         self.settings.setValue('conflict_policy', conflict_policy)
         self.settings.setValue('format_policy', format_policy)
         self.settings.setValue('same_format_policy', same_format_policy)
         self.settings.setValue('refresh_on_startup', refresh_on_startup)
-        self.settings.setValue('artwork', json.dumps(asdict(artwork)))
         self.changed.emit()
         return True
 
@@ -305,24 +351,112 @@ class Backend(QObject):
                     protected = [self.cache.directory.resolve(), Path(self.settings.fileName()).resolve(), self.index_path.resolve()]
                     if any(p == path or path in p.parents for p in protected):
                         raise ValueError('Choose a music subfolder outside the app’s settings, database, and cache.')
-                self.folderChosen.emit((str(path), source))
+                self.folderChosen.emit((str(path), source, False))
             except Exception as error:
                 self.notify.emit(str(error))
         self.commands.submit(work)
 
+    @Slot(str)
+    def selectSource(self, path):
+        if path in self._saved_sources and path != self._source:
+            self.accept_folder((path, True, True))
+
+    @Slot(str)
+    def forgetSource(self, path):
+        if self.running or self._scanning or self.stopping or path not in self._saved_sources:
+            return
+        self._saved_sources.remove(path)
+        self.settings.setValue('sources', self._saved_sources)
+        if path == self._source:
+            self._source = ''
+            self.settings.remove('source')
+            self.reset_library_for_root('')
+            self._library_status = 'Choose your music library to get started'
+            self._library_progress = 0
+            self._library_done = self._library_total = 0
+            self.confirmSourceAvailable()
+            self.libraryProgressChanged.emit()
+            self.schedule_query()
+        self.submit_command(self.delete_source_cache, path)
+        self.changed.emit()
+
+    def delete_source_cache(self, path):
+        try:
+            with self.cache_lock:
+                directory = self.cache.source_directory(path)
+                if directory.exists():
+                    shutil.rmtree(directory)
+                index = LibraryIndex(self.index_path)
+                try:
+                    legacy_urls = index.forget_library(path)
+                finally:
+                    index.close()
+                for url in legacy_urls:
+                    thumbnail = Path(QUrl(url).toLocalFile())
+                    if thumbnail.parent == self.cache.directory and thumbnail.suffix == '.jpg':
+                        thumbnail.unlink(missing_ok=True)
+        except Exception as error:
+            self.notify.emit(f'Could not fully clear the removed source cache: {error}')
+
+    @Slot(str)
+    def selectTarget(self, path):
+        if path in self._target_artwork and path != self._target:
+            self.accept_folder((path, False, True))
+
+    @Slot(str)
+    def forgetTarget(self, path):
+        if self.running or self.stopping or path not in self._target_artwork:
+            return
+        del self._target_artwork[path]
+        if path == self._target:
+            self._target = ''
+            self._target_availability = None
+            self.settings.remove('target')
+        self.persist_target_artwork()
+        self.changed.emit()
+
     @Slot(object)
     def accept_folder(self, result):
-        path, source = result
+        path, source, saved_only = result
         if self.running or (source and self._scanning) or self.stopping:
             return
+        if saved_only and path not in (self._saved_sources if source else self._target_artwork):
+            return
         if source:
+            if path not in self._saved_sources:
+                self._saved_sources.append(path)
+                self.settings.setValue('sources', self._saved_sources)
             self._source = path
+            self.confirmSourceAvailable()
         else:
+            if path not in self._target_artwork:
+                self._target_artwork[path] = self._art
+                self.persist_target_artwork()
             self._target = path
+            self._target_availability = None if saved_only else True
+            self._next_target_check = 0
         self.settings.setValue('source' if source else 'target', path)
         self.changed.emit()
         if source:
             self.rescan()
+
+    def poll_target_availability(self):
+        if self._target_check is not None:
+            path, check = self._target_check
+            if not check.done():
+                return
+            self._target_check = None
+            try:
+                available = check.result()
+            except OSError:
+                available = False
+            if path == self._target and available != self._target_availability:
+                self._target_availability = available
+                self.changed.emit()
+        now = time.monotonic()
+        if self._target and now >= self._next_target_check:
+            self._target_check = (self._target, self.commands.submit(Path(self._target).is_dir))
+            self._next_target_check = now + 1
 
     def post_library(self, event):
         with self.mailbox_lock:
@@ -333,9 +467,10 @@ class Backend(QObject):
             return
         self.query_generation += 1
         self._selected_album_id = ''
-        self.libraryReset.emit()
         with self.catalog_lock:
             self.catalog = {}
+            self._albums = []
+        self.libraryReset.emit()
         self.album_model.submit([])
         self.folder_model.submit([])
         self.track_model.submit([])
@@ -645,14 +780,14 @@ class Backend(QObject):
                 token, album, root = self.cover_jobs.popleft()
             try:
                 with self.cache_lock:
-                    if token[3] != self.cache_generation:
+                    if token[3] != self.cache_generation or (root != self._source and root not in self._saved_sources):
                         continue
-                    url = self.cache.get([t['path'] for t in album['tracks']])
-                if token[3] == self.cache_generation and not self.stopping:
+                    cache = ThumbnailCache(self.cache.source_directory(root))
+                    url = cache.get([t['path'] for t in album['tracks']])
                     if index is None:
                         index = LibraryIndex(self.index_path)
                     index.save_artwork(root, album['id'], album['fingerprint'], url)
-                    self.coverReady.emit((token, url))
+                self.coverReady.emit((token, url))
             except Exception:
                 self.coverReady.emit((token, ''))
 
@@ -678,6 +813,10 @@ class Backend(QObject):
             with self.cache_lock:
                 self.cache_generation += 1
                 self.cache.clear()
+                for source in {*self._saved_sources, self._source}:
+                    directory = self.cache.source_directory(source)
+                    if directory.exists():
+                        shutil.rmtree(directory)
             with self.catalog_lock:
                 self.catalog = {k: dict(a, cover='') for k, a in self.catalog.items()}
                 self.cover_pending.clear()
@@ -696,8 +835,7 @@ class Backend(QObject):
         try:
             value = ArtworkSettings(enabled, filename, width, height)
             value.validate()
-            self._art = value
-            self.settings.setValue('artwork', json.dumps(asdict(value)))
+            self.store_artwork(value, self._target)
             self.changed.emit()
             self.notify.emit('Artwork settings saved.')
         except ValueError as error:
@@ -706,6 +844,115 @@ class Backend(QObject):
     def submit_command(self, function, *args):
         if not self.stopping:
             return self.commands.submit(function, *args)
+
+    @Slot(str, int, int)
+    @Slot(str, int, int, str)
+    def resizeAllArtwork(self, filename, width, height, path=None):
+        path = self._target if path is None else path
+        if self.running or self.stopping or not path or (path != self._target and path not in self._target_artwork):
+            return
+        artwork = ArtworkSettings(filename=filename, width=width, height=height)
+        try:
+            artwork.validate()
+        except ValueError as error:
+            self.finish_artwork_resize(str(error))
+            return
+        self._resizing_artwork = True
+        self._artwork_resize_done = self._artwork_resize_total = 0
+        self._artwork_resize_status = 'Finding destination covers…'
+        self.changed.emit()
+        self.submit_command(self.resize_destination_artwork, path, self._source, artwork)
+
+    def resize_destination_artwork(self, path, source, artwork):
+        resized = generated = unchanged = missing = failed = 0
+        first_error = ''
+
+        def report_error(error):
+            nonlocal failed, first_error
+            failed += 1
+            if not first_error:
+                first_error = str(error)
+
+        try:
+            target = Path(path).resolve()
+            target_stat = target.stat()
+            job = dict(target=target, root=source, device=target_stat.st_dev)
+
+            def validate(output):
+                self.validate_output(output, job)
+                if target.resolve() != target or target.stat().st_ino != target_stat.st_ino:
+                    raise OSError(errno.ENODEV, 'Destination folder changed')
+
+            validate(target)
+            covers = []
+            for folder, _, names in os.walk(target, onerror=report_error):
+                if self.stopping:
+                    return
+                folder = Path(folder)
+                output = folder / artwork.filename
+                tracks = [folder / name for name in names if Path(name).suffix.lower() in EXTENSIONS]
+                existing = artwork.filename in names
+                if (existing or tracks) and not output.is_symlink():
+                    covers.append((output, tracks, existing))
+
+            total = len(covers)
+            self.artworkResizeAdvanced.emit(0, total)
+            next_update = time.monotonic()
+            for done, (output, tracks, existing) in enumerate(covers, 1):
+                if self.stopping:
+                    return
+                try:
+                    def validate_cover():
+                        validate(output)
+                        if output.is_symlink() or (existing and not output.is_file()) or (not existing and output.exists()):
+                            raise OSError(f'Cover changed during update: {output}')
+
+                    validate_cover()
+                    tracks = [track for track in tracks if not track.is_symlink() and track.is_file()]
+                    if existing:
+                        data = regenerate_cover(output, tracks, artwork.width, artwork.height)
+                    else:
+                        original = cover_image(tracks)
+                        data = jpeg_bytes(original, artwork.width, artwork.height) if original is not None else None
+                    if data is None and existing:
+                        unchanged += 1
+                    elif data is None:
+                        missing += 1
+                    else:
+                        atomic_write(output, lambda stream: stream.write(data), lambda: self.stopping, validate_cover)
+                        if existing:
+                            resized += 1
+                        else:
+                            generated += 1
+                except Cancelled:
+                    return
+                except Exception as error:
+                    report_error(error)
+                now = time.monotonic()
+                if done == total or now >= next_update:
+                    self.artworkResizeAdvanced.emit(done, total)
+                    next_update = now + 0.1
+        except Exception as error:
+            report_error(error)
+        message = f'Artwork update complete: {resized} resized, {unchanged} already the right size, {generated} generated.'
+        if missing:
+            message += f' No embedded artwork in {missing} folder(s).'
+        if failed:
+            message += f' Errors: {failed}. {first_error}'
+        self.artworkResizeFinished.emit(message)
+
+    @Slot(int, int)
+    def update_artwork_resize(self, done, total):
+        self._artwork_resize_done, self._artwork_resize_total = done, total
+        self._artwork_resize_status = f'Checking covers: {done:,} of {total:,}'
+        self.changed.emit()
+
+    @Slot(str)
+    def finish_artwork_resize(self, message):
+        self._resizing_artwork = False
+        self._artwork_resize_status = message
+        self.changed.emit()
+        self.notify.emit(message)
 
     def prepare_selection(self, kind, identifiers, selected, art):
         try:
@@ -730,7 +977,7 @@ class Backend(QObject):
             return
         self._preparing += 1
         self.changed.emit()
-        self.submit_command(self.prepare_selection, kind, identifiers, selected, self._art)
+        self.submit_command(self.prepare_selection, kind, identifiers, selected, self.target_artwork())
 
     @Slot(str, 'QVariantList')
     def send(self, identifier, selected):
@@ -789,6 +1036,7 @@ class Backend(QObject):
     def poll_workers(self):
         if self.stopping:
             return
+        self.poll_target_availability()
         # GUI callback: take mailboxes only, then apply bounded model operations.
         with self.mailbox_lock:
             events = list(self.library_events)
@@ -894,9 +1142,14 @@ class Backend(QObject):
         if overlaps(Path(self._source), Path(self._target)):
             self.notify.emit('Source and destination overlap.')
             return
-        if not Path(self._target).is_dir():
+        try:
+            target_stat = Path(self._target).stat()
+        except OSError:
+            target_stat = None
+        if target_stat is None or not S_ISDIR(target_stat.st_mode):
             self.notify.emit('The destination is unavailable.')
             return
+        artwork = artwork or self.target_artwork()
         with self.condition:
             if not self._running:
                 self._album_totals.clear()
@@ -908,7 +1161,7 @@ class Backend(QObject):
                 existing.add(track['path'])
                 self._album_totals[album['id']] = self._album_totals.get(album['id'], 0) + 1
                 self._queue.append(dict(track, id=track['path'], album_id=album['id'], state='Pending', fraction=0.0,
-                                        cancelled=False, art=artwork or self._art, root=self._source, target=self._target, device=Path(self._target).stat().st_dev))
+                                        cancelled=False, art=artwork, root=self._source, target=self._target, device=target_stat.st_dev))
             if self._queue and not self._running:
                 self._running = True
                 self.apply = None
@@ -1350,7 +1603,7 @@ class Backend(QObject):
         target = Path(job['target'])
         if not target.is_dir() or target.stat().st_dev != job['device']:
             raise OSError(errno.ENODEV, 'Destination unavailable or device changed')
-        if overlaps(Path(job['root']), target):
+        if job['root'] and overlaps(Path(job['root']), target):
             raise ValueError('Source and destination overlap; write refused.')
         output.resolve().relative_to(target.resolve())
 
@@ -1368,6 +1621,8 @@ def main():
     os.environ.setdefault('QT_QUICK_CONTROLS_STYLE', 'Basic')
     app = QGuiApplication(sys.argv)
     app.setApplicationName('GrooveGrab')
+    app.setDesktopFileName('groovegrab')
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / 'icons' / 'groovegrab.svg')))
     app.setQuitOnLastWindowClosed(False)
     backend = Backend()
     backend.shutdownFinished.connect(app.quit)

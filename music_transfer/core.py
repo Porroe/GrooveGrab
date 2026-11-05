@@ -28,8 +28,8 @@ def destination(source: Path, root: Path, target: Path) -> Path:
 
 @dataclass(frozen=True)
 class ArtworkSettings:
-    enabled: bool = True
-    filename: str = 'folder.jpg'
+    enabled: bool = False
+    filename: str = 'cover.jpg'
     width: int = 500
     height: int = 500
 
@@ -184,18 +184,37 @@ def cover_image(paths):
     return fallback
 
 
-def jpeg_bytes(image, width, height):
+def jpeg_bytes(image, width, height, *, skip_size=None):
     image = image.copy()
     image.thumbnail((width, height), Image.Resampling.LANCZOS)
+    if image.size == skip_size:
+        return None
     buffer = io.BytesIO()
     image.save(buffer, 'JPEG', quality=90)
     return buffer.getvalue()
+
+
+def regenerate_cover(output, tracks, width, height):
+    original = cover_image(tracks)
+    try:
+        with Image.open(output) as existing:
+            current = ImageOps.exif_transpose(existing)
+    except OSError:
+        if original is None:
+            raise
+        current = None
+    if original is None:
+        original = current.convert('RGB')
+    return jpeg_bytes(original, width, height, skip_size=current.size if current else None)
 
 
 class ThumbnailCache:
     def __init__(self, directory=None):
         self.directory = Path(directory or Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'music-transfer' / 'covers')
         self.directory.mkdir(parents=True, exist_ok=True)
+
+    def source_directory(self, source):
+        return self.directory / hashlib.sha256(os.fsencode(source)).hexdigest()
 
     def get(self, paths):
         fingerprint = []

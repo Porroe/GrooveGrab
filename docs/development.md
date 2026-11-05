@@ -29,18 +29,19 @@ The editable install exposes the `groovegrab` command as well. Run the GUI from 
 
 ## Runtime and data flow
 
-1. The QML window binds to a `Backend` instance. Settings are persisted using Qt `QSettings`.
-2. The selected source is loaded from the SQLite index first. When startup refresh is enabled (the default), a background scan then discovers additions, edits, and deletions. When disabled, the saved index is loaded without walking the source; an explicit refresh or choosing a source starts a scan.
+1. The QML window binds to a `Backend` instance. Qt `QSettings` stores the active paths, saved sources, and artwork profiles for each destination. Older saved dimensions inherit the former shared filename and generation toggle.
+2. The selected source is loaded from the SQLite index first. Choosing another saved source switches the catalog to that path. When startup refresh is enabled (the default), a background scan then discovers additions, edits, and deletions. When disabled, the saved index is loaded without walking the source; an explicit refresh or choosing a source starts a scan.
 3. `LibraryIndex.refresh()` reuses metadata for files whose size and nanosecond modification time are unchanged. Metadata reads and database access happen off the UI thread. Worker results are sent back to the Qt thread for publication.
 4. Albums and tracks are published through `RecordModel`. Queries and large model updates are processed incrementally to keep the interface responsive.
-5. Queue preparation and file copying run in workers. QML receives progress and conflict requests through Qt signals. Audio is written safely to the destination; the source remains read-only.
+5. Queue preparation, destination availability checks, and file copying run off the UI thread. QML receives progress and conflict requests through Qt signals. Each queued transfer captures the artwork settings for its destination.
+6. **Update all covers** runs on a worker using the destination selected in Artwork settings. It counts candidate folders, reports progress as each is checked, and uses atomic writes for new or resized covers.
 
-The SQLite database defaults to `$XDG_DATA_HOME/music-transfer/library.sqlite3` (or `~/.local/share/music-transfer/library.sqlite3`). Thumbnail data defaults to `$XDG_CACHE_HOME/music-transfer/covers` (or `~/.cache/music-transfer/covers`). These locations are outside the source library.
+The SQLite database defaults to `$XDG_DATA_HOME/music-transfer/library.sqlite3` (or `~/.local/share/music-transfer/library.sqlite3`). Thumbnail data defaults to `$XDG_CACHE_HOME/music-transfer/covers` (or `~/.cache/music-transfer/covers`). New thumbnails are stored under a subdirectory keyed by the source path. SQLite rows are scoped by source. Switching sources preserves both caches, while removing a saved source deletes its thumbnails and index rows. **Clear thumbnail cache** clears thumbnails across sources and retains indexed track metadata.
 
 ## Invariants when changing behavior
 
 - Never write, rename, delete, or cache files inside the source library.
-- Keep saved index entries when a source is unavailable, unreadable, or a refresh is canceled. Only commit removals after a successful scan.
+- Keep saved index entries when a source is unavailable, unreadable, or a refresh is canceled. During refresh, commit removals only after a successful scan. Explicit source removal deletes that source’s cached data.
 - Loading the saved index must remain distinct from refreshing the filesystem. Do not trigger a scan when startup refresh is disabled unless the user chooses or refreshes a source.
 - Keep filesystem, database, artwork, and transfer work off the Qt GUI thread. Preserve responsiveness for large libraries and during shutdown.
 - Validate destination paths and revalidate them before writes. Do not allow source/destination overlap or traversal outside the selected destination.
@@ -67,4 +68,4 @@ When adding UI behavior, cover both the exposed backend behavior and the QML int
 
 ## Packaging
 
-Project metadata and dependencies are in `pyproject.toml`. QML files are included as package data, and the desktop launcher is installed from `packaging/groovegrab.desktop`. Keep runtime dependencies there and verify that an editable install and the `groovegrab` entry point still work after packaging changes.
+Project metadata and dependencies are in `pyproject.toml`. QML files and SVG assets are included as package data. The desktop entry and hicolor launcher icon are also installed under the installation prefix. Qt uses the desktop entry name `groovegrab` to associate the app window with the launcher. Keep runtime dependencies there and verify that an editable install and the `groovegrab` entry point still work after packaging changes.

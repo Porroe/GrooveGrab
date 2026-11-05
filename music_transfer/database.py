@@ -99,6 +99,15 @@ class LibraryIndex:
             self.connection.execute('INSERT OR REPLACE INTO artwork VALUES (?,?,?,?)',
                                     (root, album_id, fingerprint, url))
 
+    def forget_library(self, root):
+        with self.connection:
+            urls = {row[0] for row in self.connection.execute(
+                'SELECT url FROM artwork WHERE root=?', (root,))}
+            self.connection.execute('DELETE FROM artwork WHERE root=?', (root,))
+            self.connection.execute('DELETE FROM tracks WHERE root=?', (root,))
+            self.connection.execute('DELETE FROM libraries WHERE root=?', (root,))
+            return urls - {row[0] for row in self.connection.execute('SELECT DISTINCT url FROM artwork')}
+
     def refresh(self, root, *, cancelled=lambda: False, progress=lambda *args: None,
                 batch=lambda tracks, removed: None):
         root = Path(root).resolve()

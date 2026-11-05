@@ -13,10 +13,11 @@ dependencies = ["PySide6>=6.7,<7", "mutagen>=1.47", "Pillow>=10"]
 groovegrab = "music_transfer.app:main"
 
 [tool.setuptools.package-data]
-music_transfer = ["qml/*.qml"]
+music_transfer = ["qml/*.qml", "qml/*.svg", "icons/groovegrab.svg"]
 
 [tool.setuptools.packages.find]
 include = ["music_transfer*"]
 
 [tool.setuptools.data-files]
 "share/applications" = ["packaging/groovegrab.desktop"]
+"share/icons/hicolor/scalable/apps" = ["music_transfer/icons/groovegrab.svg"]

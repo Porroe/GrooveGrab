@@ -13,10 +13,11 @@ from PIL import Image
 from mutagen.wave import WAVE
 from mutagen.id3 import TIT2, TALB, TPE2, APIC, TRCK, TPOS
 from PySide6.QtGui import QGuiApplication
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, QUrl
 
 from music_transfer.app import Backend
 from music_transfer.core import ArtworkSettings, ThumbnailCache, scan, cover_image
+from music_transfer.database import LibraryIndex
 from test_core import snapshot
 
 APP = QGuiApplication.instance() or QGuiApplication([])
@@ -56,8 +57,9 @@ class AppFixture(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.source = self.root / 'source'; self.source.mkdir()
         self.target = self.root / 'target'; self.target.mkdir()
-        self.backend = Backend(index_path=self.root / 'data/library.sqlite3')
-        self.backend.settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
+        settings = QSettings(str(self.root / 'settings.ini'), QSettings.IniFormat)
+        with patch('music_transfer.app.QSettings', return_value=settings):
+            self.backend = Backend(index_path=self.root / 'data/library.sqlite3')
         self.backend._refresh_on_startup = self.backend.settings.value('refresh_on_startup', True, type=bool)
         self.backend.setConflictPolicy('ask_every_time')
         self.backend.setFormatPolicy('ask_every_time')
@@ -87,12 +89,141 @@ class AppFixture(unittest.TestCase):
 
 
 class AppTests(AppFixture):
+    def test_saved_sources_switch_catalogs_and_forget_active_source(self):
+        other = self.root / 'second library'
+        make_wave(other / 'Other' / 'song.wav', album='Other')
+        self.backend.chooseFolder(QUrl.fromLocalFile(str(self.source)).toString(), True)
+        wait_for(lambda: self.backend.savedSources == [str(self.source)] and not self.backend.scanning)
+        first_id = self.backend._albums[0]['id']
+        self.backend.requestCover(first_id)
+        wait_for(lambda: bool(self.backend.catalog[first_id]['cover']))
+        first_cover = Path(QUrl(self.backend.catalog[first_id]['cover']).toLocalFile())
+        self.backend.chooseFolder(QUrl.fromLocalFile(str(other)).toString(), True)
+        wait_for(lambda: self.backend.source == str(other) and not self.backend.scanning)
+        self.assertEqual([album['title'] for album in self.backend._albums], ['Other'])
+        other_id = self.backend._albums[0]['id']
+        self.backend.requestCover(other_id)
+        wait_for(lambda: bool(self.backend.catalog[other_id]['cover']))
+        other_cover = Path(QUrl(self.backend.catalog[other_id]['cover']).toLocalFile())
+        self.assertNotEqual(first_cover.parent, other_cover.parent)
+
+        self.backend.selectSource(str(self.source))
+        wait_for(lambda: self.backend.source == str(self.source) and not self.backend.scanning)
+        self.assertEqual([album['title'] for album in self.backend._albums], ['Album'])
+        self.assertEqual(self.backend.catalog[first_id]['cover'], first_cover.as_uri())
+        self.backend.forgetSource(str(self.source))
+        wait_for(lambda: self.backend.album_model.count == 0)
+        self.backend.commands.submit(lambda: None).result(timeout=5)
+        self.assertFalse(first_cover.parent.exists())
+        self.assertTrue(other_cover.is_file())
+        index = LibraryIndex(self.backend.index_path)
+        try:
+            self.assertFalse(index.load(self.source))
+            self.assertTrue(index.load(other))
+        finally:
+            index.close()
+        self.assertEqual(self.backend.source, '')
+        self.assertEqual(self.backend.savedSources, [str(other)])
+        self.assertEqual(self.backend.settings.value('sources', type=list), [str(other)])
+        self.assertTrue((self.source / 'Artist/Album/01.wav').is_file())
+
+    def test_saved_destination_can_be_selected_offline_and_used_after_reconnecting(self):
+        offline = self.root / 'removable'
+        self.backend._target_artwork[str(offline)] = ArtworkSettings(width=300, height=300)
+        messages = []
+        self.backend.notify.connect(messages.append)
+
+        self.backend.selectTarget(str(offline))
+        self.assertEqual(self.backend.target, str(offline))
+        wait_for(lambda: self.backend.targetUnavailable)
+        self.backend.send(self.album['id'], [])
+        wait_for(lambda: 'The destination is unavailable.' in messages)
+        self.assertFalse(self.backend._queue)
+
+        offline.mkdir()
+        wait_for(lambda: self.backend.targetAvailable)
+        self.backend.send(self.album['id'], [])
+        wait_for(lambda: not self.backend.running)
+        self.assertTrue((offline / 'Artist/Album/01.wav').is_file())
+
+    def test_resize_all_regenerates_only_matching_destination_covers(self):
+        album = self.target / 'Artist' / 'Album'
+        make_wave(album / 'song.wav')
+        cover = album / 'cover.jpg'
+        Image.new('RGB', (8, 4), 'blue').save(cover)
+        other_name = album / 'other.jpg'
+        Image.new('RGB', (50, 50)).save(other_name)
+        other_bytes = other_name.read_bytes()
+        already_sized = self.target / 'cover.jpg'
+        Image.new('RGB', (24, 12)).save(already_sized, quality=35)
+        unchanged_bytes = already_sized.read_bytes()
+        fallback = self.target / 'Loose' / 'cover.jpg'
+        fallback.parent.mkdir()
+        Image.new('RGB', (40, 80)).save(fallback)
+        linked = self.target / 'Linked' / 'cover.jpg'
+        linked.parent.mkdir()
+        linked.symlink_to(other_name)
+        missing = self.target / 'Missing' / 'cover.jpg'
+        make_wave(missing.parent / 'song.wav')
+
+        self.backend.resizeAllArtwork('cover.jpg', 24, 24)
+        wait_for(lambda: not self.backend.running)
+
+        with Image.open(cover) as image:
+            self.assertEqual(image.size, (24, 12))
+            self.assertGreater(image.getpixel((0, 0))[0], 200)
+        with Image.open(fallback) as image:
+            self.assertEqual(image.size, (12, 24))
+        with Image.open(missing) as image:
+            self.assertEqual(image.size, (24, 12))
+        self.assertEqual(already_sized.read_bytes(), unchanged_bytes)
+        self.assertEqual(other_name.read_bytes(), other_bytes)
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual((self.backend.artworkResizeDone, self.backend.artworkResizeTotal), (4, 4))
+        self.assertIn('2 resized, 1 already the right size, 1 generated', self.backend.artworkResizeStatus)
+
+    def test_saved_destinations_restore_and_export_their_own_cover_sizes(self):
+        second = self.root / 'second target'
+        second.mkdir()
+        self.backend.saveArtwork(True, 'cover.jpg', 24, 12)
+        self.backend.chooseFolder(QUrl.fromLocalFile(str(second)).toString(), False)
+        wait_for(lambda: self.backend.target == str(second))
+        self.backend.saveArtwork(True, 'cover.jpg', 18, 18)
+
+        settings_path = self.backend.settings.fileName()
+        self.backend.settings.sync()
+        with patch('music_transfer.app.QSettings', return_value=QSettings(settings_path, QSettings.IniFormat)):
+            restored = Backend(index_path=self.root / 'data/library.sqlite3')
+        try:
+            self.assertEqual(restored.savedTargets, [str(self.target), str(second)])
+            self.assertEqual(restored.target, str(second))
+            self.assertEqual((restored.artwork['width'], restored.artwork['height']), (18, 18))
+        finally:
+            restored.shutdown()
+            wait_for(lambda: restored.shutdownComplete)
+
+        for target, expected in ((second, (18, 9)), (self.target, (24, 12))):
+            self.backend.selectTarget(str(target))
+            wait_for(lambda: self.backend.target == str(target))
+            self.backend.send(self.album['id'], [])
+            wait_for(lambda: not self.backend.running)
+            with Image.open(target / 'Artist' / 'Album' / 'cover.jpg') as cover:
+                self.assertEqual(cover.size, expected)
+
+        self.backend.forgetTarget(str(self.target))
+        self.assertEqual(self.backend.savedTargets, [str(second)])
+        self.assertEqual(self.backend.target, '')
+        self.assertFalse(self.backend.settings.contains('target'))
+        self.assertTrue((self.target / 'Artist/Album/cover.jpg').is_file())
+        self.backend.selectTarget(str(second))
+        wait_for(lambda: self.backend.target == str(second))
+
     def test_accepting_source_folder_saves_and_rescans(self):
         selected = self.root / 'selected-source'
         selected.mkdir()
         self.backend._refresh_on_startup = False
         with patch.object(self.backend, 'rescan') as rescan:
-            self.backend.accept_folder((str(selected), True))
+            self.backend.accept_folder((str(selected), True, False))
         self.assertEqual(self.backend.source, str(selected))
         self.assertEqual(self.backend.settings.value('source'), str(selected))
         rescan.assert_called_once_with()
@@ -133,7 +264,7 @@ class AppTests(AppFixture):
     def test_artwork_and_metadata_from_real_wave(self):
         self.assertEqual(self.album['title'], 'Album')
         self.assertEqual(self.album['artist'], 'Test artist')
-        self.backend._art = ArtworkSettings(filename='cover.jpeg', width=500, height=500)
+        self.backend._art = ArtworkSettings(enabled=True, filename='cover.jpeg', width=500, height=500)
         self.backend.send(self.album['id'], [])
         wait_for(lambda: not self.backend.running)
         with Image.open(self.target / 'Artist/Album/cover.jpeg') as image:
@@ -141,8 +272,8 @@ class AppTests(AppFixture):
         self.backend.cache.get([t['path'] for t in self.album['tracks']])
 
     def test_artwork_conflict_does_not_block_new_audio(self):
-        self.existing('folder.jpg')
-        self.backend._art = ArtworkSettings()
+        self.existing('cover.jpg')
+        self.backend._art = ArtworkSettings(enabled=True)
         self.backend.send(self.album['id'], [self.album['tracks'][0]['path']])
         wait_for(lambda: self.backend.conflictCount == 1)
         self.backend.send(self.album['id'], [self.album['tracks'][1]['path']])

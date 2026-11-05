@@ -18,18 +18,14 @@ ApplicationWindow {
     property var selectedTracks: []
     property var selectedTrackDetails: []
     property string contextAlbumId: ""
-    property string artistFilter: "All artists"
     property string conflictKind: "same_path"
     property string formatCandidatePath: ""
     property var formatCandidatePaths: []
-    property bool folderMode: false
     property bool shuttingDown: false
     onClosing: function(event) { if (!backend.shutdownComplete) { event.accepted = false; shuttingDown = true; backend.shutdown() } }
-    onArtistFilterChanged: backend.setFilter(search.text, artistFilter)
     property var expandedAlbums: ({})
     property var selectedAlbums: []
     property var selectedAlbumDetails: []
-    property var collapsedFolders: ({})
     function toggleAlbumSelection(album) {
         let ids = win.selectedAlbums.slice()
         let details = win.selectedAlbumDetails.slice()
@@ -172,7 +168,7 @@ ApplicationWindow {
     FolderDialog { id: targetPicker; title: "Choose destination"; onAccepted: backend.chooseFolder(selectedFolder.toString(), false) }
     Connections {
         target: backend
-        function onLibraryReset() { win.selectedAlbums = []; win.selectedAlbumDetails = []; win.selectedAlbum = null; win.selectedTracks = []; win.selectedTrackDetails = []; win.artistFilter = "All artists"; search.text = ""; artistPicker.currentIndex = 0 }
+        function onLibraryReset() { win.selectedAlbums = []; win.selectedAlbumDetails = []; win.selectedAlbum = null; win.selectedTracks = []; win.selectedTrackDetails = []; search.text = "" }
         function onNotify(message) { notice.text = message; toast.open() }
         function onConflict(path) { win.conflictKind = "same_path"; conflictPath.text = path; applyAll.checked = false; conflictDialog.open() }
         function onFormatConflict(kind, path, candidates) {
@@ -188,17 +184,13 @@ ApplicationWindow {
             if ((!backend.running || backend.conflictCount === 0) && conflictDialog.visible) conflictDialog.close()
         }
     }
-    Connections {
-        target: backend.artists
-        function onCountChanged() { if (artistPicker.currentIndex < 0 && backend.artists.count > 0) artistPicker.currentIndex = 0 }
-    }
     Menu {
         id: albumContextMenu
         objectName: "albumContextMenu"
         MenuItem {
             objectName: "copyAlbumMenuItem"
             text: "Copy this album"
-            enabled: !!backend.target
+            enabled: backend.targetAvailable
             onTriggered: backend.send(win.contextAlbumId, [])
         }
     }
@@ -214,7 +206,11 @@ ApplicationWindow {
         anchors.fill: parent; anchors.margins: 24; spacing: 18
         RowLayout {
             Layout.fillWidth: true
-            Rectangle { width: 44; height: 44; radius: 13; color: win.accent; Label { anchors.centerIn: parent; text: "♫"; font.pixelSize: 28; color: win.bg } }
+            Image {
+                Layout.preferredWidth: 44; Layout.preferredHeight: 44
+                source: "../icons/groovegrab.svg"
+                fillMode: Image.PreserveAspectFit
+            }
             ColumnLayout { spacing: 2
                 Label { text: "GrooveGrab"; color: win.ink; font.pixelSize: 25; font.bold: true }
                 Caption { text: "Your library. Ready to go." }
@@ -229,7 +225,25 @@ ApplicationWindow {
                     ColumnLayout {
                         Layout.fillWidth: true; spacing: 1
                         Caption { text: "SOURCE LIBRARY · READ ONLY" }
-                        Label { Layout.fillWidth: true; text: backend.source || "Choose your music folder"; color: win.ink; elide: Text.ElideMiddle }
+                        Label {
+                            Layout.fillWidth: true; visible: !savedSourcePicker.visible
+                            text: backend.source || "Choose your music folder"
+                            color: win.ink; elide: Text.ElideMiddle
+                        }
+                        Picker {
+                            id: savedSourcePicker; objectName: "savedSourcePicker"
+                            Layout.fillWidth: true; Layout.preferredHeight: 28
+                            visible: count > 1 || (count > 0 && !backend.source)
+                            enabled: !backend.running && !backend.scanning
+                            Accessible.name: "Saved sources"
+                            model: backend.savedSources
+                            displayText: currentIndex < 0 ? "Choose a saved source" : currentText
+                            currentIndex: model.indexOf(backend.source)
+                            onActivated: function(index) {
+                                backend.selectSource(textAt(index))
+                                currentIndex = Qt.binding(() => model.indexOf(backend.source))
+                            }
+                        }
                         Label {
                             objectName: "sourceUnavailableMessage"
                             Layout.fillWidth: true; visible: win.sourceUnavailable
@@ -242,9 +256,38 @@ ApplicationWindow {
                 }
             }
             Label { text: "→"; font.pixelSize: 24; color: win.muted }
-            Rectangle { Layout.fillWidth: true; height: 76; radius: 12; color: win.panel
+            Rectangle { Layout.fillWidth: true; height: backend.targetUnavailable ? 94 : 76; radius: 12; color: win.panel
                 RowLayout { anchors.fill: parent; anchors.margins: 14
-                    ColumnLayout { Layout.fillWidth: true; Caption { text: "DESTINATION" } Label { Layout.fillWidth: true; text: backend.target || "Choose an SD card, USB drive, or folder"; color: win.ink; elide: Text.ElideMiddle } }
+                    ColumnLayout {
+                        Layout.fillWidth: true; spacing: 1
+                        Caption { text: "DESTINATION" }
+                        Label {
+                            Layout.fillWidth: true; visible: !savedTargetPicker.visible
+                            text: backend.target || "Choose an SD card, USB drive, or folder"
+                            color: win.ink; elide: Text.ElideMiddle
+                        }
+                        Picker {
+                            id: savedTargetPicker; objectName: "savedTargetPicker"
+                            Layout.fillWidth: true; Layout.preferredHeight: 28
+                            visible: model.length > 1 || (model.length > 0 && !backend.target)
+                            enabled: !backend.running && !backend.scanning
+                            Accessible.name: "Saved destinations"
+                            model: backend.savedTargets
+                            displayText: currentIndex < 0 ? "Choose a saved destination" : currentText
+                            currentIndex: model.indexOf(backend.target)
+                            onActivated: function(index) {
+                                backend.selectTarget(textAt(index))
+                                currentIndex = Qt.binding(() => model.indexOf(backend.target))
+                            }
+                        }
+                        Label {
+                            objectName: "targetUnavailableMessage"
+                            Layout.fillWidth: true; visible: backend.targetUnavailable
+                            text: "Destination unavailable. Reconnect the drive or choose another folder."
+                            color: win.dark ? "#ff7777" : "#c62828"
+                            font.pixelSize: 11; elide: Text.ElideRight
+                        }
+                    }
                     Action { text: "Browse"; enabled: !backend.running && !backend.scanning; onClicked: targetPicker.open() }
                 }
             }
@@ -254,38 +297,40 @@ ApplicationWindow {
             ColumnLayout {
                 Layout.fillWidth: true; Layout.fillHeight: true; spacing: 14
                 RowLayout {
-                    Item {
+                    Rectangle {
                         Layout.fillWidth: true; implicitHeight: 40
-                        Entry {
-                            id: search; objectName: "searchField"
-                            anchors.fill: parent
-                            rightPadding: 42
-                            placeholderText: "Search albums, artists, or songs…"
-                            selectByMouse: true
-                            onTextChanged: backend.setFilter(text, win.artistFilter)
-                        }
-                        ToolButton {
-                            objectName: "clearSearch"
-                            property url systemClearIcon: backend.clearButtonIcon
-                            property color themedClearColor: win.ink
-                            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
-                            width: 40; height: 40; visible: search.text.length > 0
-                            icon.source: systemClearIcon
-                            icon.color: themedClearColor
-                            icon.width: 16; icon.height: 16
-                            display: AbstractButton.IconOnly
-                            Accessible.name: "Clear search"
-                            ToolTip.text: "Clear search"; ToolTip.visible: hovered
-                            onClicked: search.clear()
+                        radius: 9; color: win.panel
+                        border.color: search.activeFocus || clearSearch.activeFocus ? win.accent : (win.dark ? "#374057" : "#dce1ed")
+                        RowLayout {
+                            anchors.fill: parent; anchors.margins: 2
+                            spacing: 0
+                            Entry {
+                                id: search; objectName: "searchField"
+                                Layout.fillWidth: true; Layout.fillHeight: true
+                                background: null
+                                verticalAlignment: TextInput.AlignVCenter
+                                placeholderText: "Search albums, artists, or songs…"
+                                selectByMouse: true
+                                onTextChanged: backend.setFilter(text, "All artists")
+                            }
+                            Button {
+                                id: clearSearch; objectName: "clearSearch"
+                                Layout.fillHeight: true; Layout.preferredWidth: 36
+                                flat: true
+                                display: AbstractButton.IconOnly
+                                icon.name: "edit-clear-symbolic"
+                                icon.source: "clear-search.svg"
+                                icon.width: 16; icon.height: 16
+                                visible: search.length > 0
+                                Accessible.name: "Clear search"
+                                ToolTip.text: "Clear search"; ToolTip.visible: hovered
+                                onClicked: {
+                                    search.clear()
+                                    search.forceActiveFocus()
+                                }
+                            }
                         }
                     }
-                    Picker {
-                        id: artistPicker; objectName: "artistPicker"
-                        Layout.preferredWidth: 160
-                        model: backend.artists; textRole: "display"
-                        onActivated: win.artistFilter = currentText
-                    }
-                    Action { text: win.folderMode ? "Albums" : "Folders"; onClicked: win.folderMode = !win.folderMode }
                     Action {
                         objectName: "manualRefreshLibrary"
                         text: "Refresh library"
@@ -294,7 +339,7 @@ ApplicationWindow {
                     }
                 }
                 RowLayout {
-                    Action { visible: win.selectedAlbums.length > 0; text: "Send selected albums (" + win.selectedAlbums.length + ")"; enabled: !!backend.target; onClicked: { backend.sendAlbums(win.selectedAlbums); win.selectedAlbums = []; win.selectedAlbumDetails = [] } }
+                    Action { visible: win.selectedAlbums.length > 0; text: "Send selected albums (" + win.selectedAlbums.length + ")"; enabled: backend.targetAvailable; onClicked: { backend.sendAlbums(win.selectedAlbums); win.selectedAlbums = []; win.selectedAlbumDetails = [] } }
                     Action { objectName: "viewCurrentSelection"; visible: win.selectedAlbums.length + win.selectedTracks.length > 0; text: "View current selection (" + (win.selectedAlbums.length + win.selectedTracks.length) + ")"; onClicked: currentSelectionDialog.open() }
                     Action { objectName: "clearAlbumSelection"; visible: win.selectedAlbums.length > 0; text: "Clear selection"; onClicked: { win.selectedAlbums = []; win.selectedAlbumDetails = [] } }
                     Label { text: backend.albums.count + " albums"; color: win.muted }
@@ -307,7 +352,7 @@ ApplicationWindow {
                 }
                 Meter { Layout.fillWidth: true; visible: backend.scanning && backend.libraryTotal > 0; value: backend.libraryProgress }
                 GridView {
-                    id: grid; objectName: "albumGrid"; Layout.fillWidth: true; Layout.fillHeight: true; clip: true; visible: !win.folderMode
+                    id: grid; objectName: "albumGrid"; Layout.fillWidth: true; Layout.fillHeight: true; clip: true
                     cacheBuffer: 0
                     cellWidth: Math.floor(width / Math.max(1, Math.floor(width / 190))); cellHeight: cellWidth + 70
                     model: backend.albums
@@ -381,22 +426,6 @@ ApplicationWindow {
                     }
                     Label { anchors.centerIn: parent; visible: !backend.albums.count; text: backend.scanning ? "Reading music tags…" : "Choose a music library to see your albums"; color: win.muted }
                 }
-                ListView {
-                    Layout.fillWidth: true; Layout.fillHeight: true; visible: win.folderMode; clip: true
-                    model: backend.folders
-                    spacing: 6
-                    ScrollBar.vertical: ScrollBar {}
-                    delegate: Rectangle {
-                        required property var modelData
-                        width: ListView.view.width; height: 48; color: win.panel; radius: 8
-                        RowLayout {
-                            anchors.fill: parent; anchors.margins: 8
-                            ToolButton { text: modelData.expanded ? "▾" : "▸"; onClicked: backend.toggleFolder(modelData.path) }
-                            Label { Layout.fillWidth: true; leftPadding: modelData.depth * 16; text: modelData.name; color: win.ink; elide: Text.ElideMiddle; ToolTip.text: modelData.path; ToolTip.visible: folderHover.hovered; HoverHandler { id: folderHover } }
-                            Action { text: "Send folder"; enabled: !!backend.target; onClicked: backend.sendFolder(modelData.path) }
-                        }
-                    }
-                }
             }
             Rectangle {
                 Layout.preferredWidth: 330; Layout.fillHeight: true; radius: 16; color: win.panel
@@ -406,7 +435,7 @@ ApplicationWindow {
                     Caption { Layout.fillWidth: true; text: backend.status; wrapMode: Text.Wrap; elide: Text.ElideNone }
                     Meter { Layout.fillWidth: true; value: backend.progress; visible: backend.running }
                     Action { text: "Resolve conflicts (" + backend.conflictCount + ")"; visible: backend.conflictCount > 0; onClicked: backend.showConflicts() }
-                    Action { text: "Resume transfer"; visible: backend.paused; onClicked: backend.resume() }
+                    Action { text: "Resume transfer"; visible: backend.paused; enabled: backend.targetAvailable; onClicked: backend.resume() }
                     ListView {
                         id: queueList; objectName: "queueList"
                         Layout.fillWidth: true; Layout.fillHeight: true; clip: true
@@ -504,8 +533,8 @@ ApplicationWindow {
                 ScrollBar.vertical: ScrollBar {}
             }
             RowLayout {
-                Action { text: "Send album"; enabled: !!backend.target; onClicked: { backend.send(win.selectedAlbum.id, []); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
-                Action { text: "Send selected (" + win.selectedTracks.length + ")"; enabled: !!backend.target && win.selectedTracks.length > 0; onClicked: { backend.send(win.selectedAlbum.id, win.selectedTracks); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
+                Action { text: "Send album"; enabled: backend.targetAvailable; onClicked: { backend.send(win.selectedAlbum.id, []); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
+                Action { text: "Send selected (" + win.selectedTracks.length + ")"; enabled: backend.targetAvailable && win.selectedTracks.length > 0; onClicked: { backend.send(win.selectedAlbum.id, win.selectedTracks); win.selectedTracks = []; win.selectedTrackDetails = []; albumDialog.close() } }
                 Action { objectName: "viewCurrentSelectionFromTracks"; visible: win.selectedAlbums.length + win.selectedTracks.length > 0; text: "View current selection"; onClicked: currentSelectionDialog.open() }
                 Item { Layout.fillWidth: true }
                 Action { text: "Close"; onClicked: albumDialog.close() }
@@ -588,6 +617,8 @@ ApplicationWindow {
         property string draftFormatPolicy: "ask_every_time"
         property string draftSameFormatPolicy: "ask_every_time"
         property bool draftRefreshOnStartup: true
+        property string draftTarget: ""
+        property var artworkDrafts: ({})
         width: Math.min(win.width - 80, 900); height: Math.min(win.height - 80, 580); modal: true
         function resetDrafts() {
             draftTheme = backend.theme
@@ -595,10 +626,30 @@ ApplicationWindow {
             draftFormatPolicy = backend.formatPolicy
             draftSameFormatPolicy = backend.sameFormatPolicy
             draftRefreshOnStartup = backend.refreshOnStartup
-            artEnabled.checked = backend.artwork.enabled
-            artName.text = backend.artwork.filename
-            artWidth.value = backend.artwork.width
-            artHeight.value = backend.artwork.height
+            artworkDrafts = {}
+            loadArtworkDraft(backend.target)
+        }
+        function captureArtworkDraft() {
+            artworkDrafts[draftTarget] = {
+                enabled: artEnabled.checked, filename: artName.text,
+                width: artWidth.value, height: artHeight.value
+            }
+        }
+        function loadArtworkDraft(path) {
+            draftTarget = path
+            const artwork = artworkDrafts[path] || backend.artworkForTarget(path)
+            artEnabled.checked = artwork.enabled
+            artName.text = artwork.filename
+            artWidth.value = artwork.width
+            artHeight.value = artwork.height
+        }
+        function removeDestination(path) {
+            backend.forgetTarget(path)
+            if (backend.savedTargets.indexOf(path) >= 0)
+                return
+            delete artworkDrafts[path]
+            if (draftTarget === path)
+                loadArtworkDraft(backend.target)
         }
         onOpened: resetDrafts()
         header: RowLayout {
@@ -678,6 +729,36 @@ ApplicationWindow {
                             leftPadding: 12
                         }
                     }
+                    Button {
+                        objectName: "settingsSourcesCategory"
+                        Layout.fillWidth: true
+                        text: "Manage Sources"
+                        onClicked: settingsDialog.category = "Sources"
+                        background: Rectangle {
+                            radius: 8
+                            color: settingsDialog.category === "Sources" ? (win.dark ? "#333b50" : "#e8e5f5") : "transparent"
+                        }
+                        contentItem: Text {
+                            text: parent.text; color: win.ink; font.pixelSize: 14
+                            horizontalAlignment: Text.AlignLeft; verticalAlignment: Text.AlignVCenter
+                            leftPadding: 12
+                        }
+                    }
+                    Button {
+                        objectName: "settingsDestinationsCategory"
+                        Layout.fillWidth: true
+                        text: "Manage Destinations"
+                        onClicked: settingsDialog.category = "Destinations"
+                        background: Rectangle {
+                            radius: 8
+                            color: settingsDialog.category === "Destinations" ? (win.dark ? "#333b50" : "#e8e5f5") : "transparent"
+                        }
+                        contentItem: Text {
+                            text: parent.text; color: win.ink; font.pixelSize: 14
+                            horizontalAlignment: Text.AlignLeft; verticalAlignment: Text.AlignVCenter
+                            leftPadding: 12
+                        }
+                    }
                     Item { Layout.fillHeight: true }
                 }
                 Rectangle {
@@ -690,7 +771,9 @@ ApplicationWindow {
                     Layout.leftMargin: 20
                     currentIndex: settingsDialog.category === "Files" ? 0
                         : settingsDialog.category === "Artwork" ? 1
-                        : settingsDialog.category === "Library" ? 2 : 3
+                        : settingsDialog.category === "Library" ? 2
+                        : settingsDialog.category === "Appearance" ? 3
+                        : settingsDialog.category === "Sources" ? 4 : 5
                     ColumnLayout {
                         objectName: "settingsFilesPane"
                         spacing: 12
@@ -725,17 +808,55 @@ ApplicationWindow {
                         objectName: "settingsArtworkPane"
                         spacing: 12
                         Label { text: "Artwork"; color: win.ink; font.pixelSize: 17; font.bold: true }
+                        Picker {
+                            objectName: "artworkDestinationPicker"
+                            Layout.fillWidth: true
+                            Accessible.name: "Artwork destination"
+                            enabled: !backend.resizingArtwork
+                            model: ["Default artwork settings"].concat(Array.from(backend.savedTargets))
+                            currentIndex: backend.savedTargets.indexOf(settingsDialog.draftTarget) + 1
+                            onActivated: function(index) {
+                                settingsDialog.captureArtworkDraft()
+                                settingsDialog.loadArtworkDraft(index === 0 ? "" : backend.savedTargets[index - 1])
+                            }
+                        }
                         CheckBox { id: artEnabled; text: "Generate artwork on destination"; checked: backend.artwork.enabled }
                         Label { text: "Filename"; color: win.ink }
                         Entry { id: artName; Layout.fillWidth: true; text: backend.artwork.filename }
                         Label { text: "Maximum dimensions (pixels)"; color: win.ink }
                         RowLayout {
                             Layout.fillWidth: true
-                            SpinBox { id: artWidth; Layout.fillWidth: true; from: 1; to: 16384; value: backend.artwork.width; editable: true }
+                            SpinBox { id: artWidth; objectName: "artworkWidth"; Layout.fillWidth: true; from: 1; to: 16384; value: backend.artwork.width; editable: true }
                             Label { text: "×"; color: win.ink }
                             SpinBox { id: artHeight; Layout.fillWidth: true; from: 1; to: 16384; value: backend.artwork.height; editable: true }
                         }
                         Caption { Layout.fillWidth: true; text: "Preserves proportions. Never enlarges smaller images."; wrapMode: Text.Wrap }
+                        Action {
+                            objectName: "resizeAllArtwork"
+                            text: "Update all covers"
+                            enabled: !!settingsDialog.draftTarget && !backend.running
+                                && (settingsDialog.draftTarget !== backend.target || backend.targetAvailable)
+                            onClicked: backend.resizeAllArtwork(artName.text, artWidth.value, artHeight.value, settingsDialog.draftTarget)
+                        }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "Updates existing covers and creates missing covers from embedded track artwork throughout the selected destination."
+                            wrapMode: Text.Wrap
+                        }
+                        Caption {
+                            Layout.fillWidth: true
+                            visible: !!text
+                            text: backend.artworkResizeStatus
+                            wrapMode: Text.Wrap
+                        }
+                        ProgressBar {
+                            Layout.fillWidth: true
+                            visible: backend.resizingArtwork
+                            indeterminate: backend.artworkResizeTotal === 0
+                            to: Math.max(1, backend.artworkResizeTotal)
+                            value: backend.artworkResizeDone
+                            Accessible.name: "Artwork update progress"
+                        }
                         Item { Layout.fillHeight: true }
                     }
                     ColumnLayout {
@@ -770,6 +891,78 @@ ApplicationWindow {
                         }
                         Item { Layout.fillHeight: true }
                     }
+                    ColumnLayout {
+                        objectName: "settingsSourcesPane"
+                        spacing: 12
+                        Label { text: "Manage Sources"; color: win.ink; font.pixelSize: 17; font.bold: true }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "Removing a source clears its cached thumbnails and library index. GrooveGrab keeps the music files."
+                            wrapMode: Text.Wrap
+                        }
+                        Caption { visible: sourceList.count === 0; text: "No saved sources" }
+                        ListView {
+                            id: sourceList
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            model: backend.savedSources
+                            clip: true
+                            spacing: 6
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: RowLayout {
+                                required property string modelData
+                                width: ListView.view.width - 14
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: parent.modelData
+                                    color: win.ink
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                                Action {
+                                    objectName: "removeSavedSource"
+                                    text: "Remove"
+                                    Accessible.name: "Remove " + parent.modelData
+                                    enabled: !backend.running && !backend.scanning
+                                    onClicked: backend.forgetSource(parent.modelData)
+                                }
+                            }
+                        }
+                    }
+                    ColumnLayout {
+                        objectName: "settingsDestinationsPane"
+                        spacing: 12
+                        Label { text: "Manage Destinations"; color: win.ink; font.pixelSize: 17; font.bold: true }
+                        Caption {
+                            Layout.fillWidth: true
+                            text: "Removing a destination takes effect immediately and clears its saved artwork settings. Files on the drive are kept."
+                            wrapMode: Text.Wrap
+                        }
+                        Caption { visible: destinationList.count === 0; text: "No saved destinations" }
+                        ListView {
+                            id: destinationList
+                            Layout.fillWidth: true; Layout.fillHeight: true
+                            model: backend.savedTargets
+                            clip: true
+                            spacing: 6
+                            ScrollBar.vertical: ScrollBar {}
+                            delegate: RowLayout {
+                                required property string modelData
+                                width: ListView.view.width - 14
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: parent.modelData
+                                    color: win.ink
+                                    wrapMode: Text.WrapAnywhere
+                                }
+                                Action {
+                                    objectName: "removeSavedDestination"
+                                    text: "Remove"
+                                    Accessible.name: "Remove " + parent.modelData
+                                    enabled: !backend.running
+                                    onClicked: settingsDialog.removeDestination(parent.modelData)
+                                }
+                            }
+                        }
+                    }
                 }
             }
             RowLayout {
@@ -784,13 +977,13 @@ ApplicationWindow {
                     objectName: "settingsSave"
                     text: "Save settings"
                     onClicked: {
+                        settingsDialog.captureArtworkDraft()
                         if (backend.saveSettings(settingsDialog.draftTheme,
                                                  settingsDialog.draftConflictPolicy,
                                                  settingsDialog.draftFormatPolicy,
                                                  settingsDialog.draftSameFormatPolicy,
                                                  settingsDialog.draftRefreshOnStartup,
-                                                 artEnabled.checked, artName.text,
-                                                 artWidth.value, artHeight.value)) {
+                                                 settingsDialog.artworkDrafts)) {
                             settingsDialog.close()
                             settingsSavedToast.open()
                             settingsToastTimer.restart()
